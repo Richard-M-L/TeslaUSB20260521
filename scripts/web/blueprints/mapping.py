@@ -6,7 +6,7 @@ from flask import Blueprint, render_template, jsonify, request, redirect, url_fo
 
 from config import (
     IMG_CAM_PATH, MAPPING_ENABLED, MAPPING_DB_PATH,
-    MAPPING_SAMPLE_RATE, MAPPING_TRIP_GAP_MINUTES, MAPPING_EVENT_THRESHOLDS,
+    MAPPING_SAMPLE_RATE, MAPPING_EVENT_THRESHOLDS,
 )
 from utils import get_base_context
 from services.video_service import get_teslacam_path
@@ -42,138 +42,13 @@ def map_view():
 
 
 # ---------------------------------------------------------------------------
-# Trip APIs
+# Waypoint APIs
 # ---------------------------------------------------------------------------
-
-@mapping_bp.route("/api/trips")
-def api_trips():
-    """List trips with optional filters."""
-    from services.mapping_queries import query_trips
-
-    limit = request.args.get('limit', 50, type=int)
-    offset = request.args.get('offset', 0, type=int)
-    date_from = request.args.get('date_from')
-    date_to = request.args.get('date_to')
-    # Default 50 m: hides parking-lot blips and isolated sentry recordings
-    # from the main trip nav. Pass ?min_distance=0 to include all trips.
-    min_distance_km = request.args.get('min_distance', 0.05, type=float)
-
-    bbox = None
-    if all(request.args.get(k) for k in ('min_lat', 'min_lon', 'max_lat', 'max_lon')):
-        try:
-            bbox = (
-                float(request.args['min_lat']),
-                float(request.args['min_lon']),
-                float(request.args['max_lat']),
-                float(request.args['max_lon']),
-            )
-        except (ValueError, TypeError):
-            pass
-
-    try:
-        trips = query_trips(MAPPING_DB_PATH, limit=limit, offset=offset,
-                            bbox=bbox, date_from=date_from, date_to=date_to,
-                            min_distance_km=min_distance_km)
-        return jsonify({'trips': trips})
-    except Exception as e:
-        logger.error("Failed to query trips: %s", e)
-        return jsonify({'error': str(e)}), 500
-
-
-@mapping_bp.route("/api/trip/<int:trip_id>/route")
-def api_trip_route(trip_id):
-    """Get GeoJSON route for a specific trip."""
-    from services.mapping_queries import query_trip_route
-
-    try:
-        waypoints = query_trip_route(MAPPING_DB_PATH, trip_id)
-        if not waypoints:
-            return jsonify({'error': 'Trip not found'}), 404
-
-        # Normalize video_path for archived clips
-        for wp in waypoints:
-            vp = wp.get('video_path', '')
-            if vp and 'ArchivedClips' in vp:
-                basename = vp.rsplit('/', 1)[-1] if '/' in vp else vp
-                wp['video_path'] = f'ArchivedClips/{basename}'
-
-        # Build GeoJSON LineString
-        coordinates = [[wp['lon'], wp['lat']] for wp in waypoints]
-        properties = {
-            'trip_id': trip_id,
-            'waypoint_count': len(waypoints),
-            'waypoints': waypoints,
-        }
-
-        geojson = {
-            'type': 'Feature',
-            'geometry': {
-                'type': 'LineString',
-                'coordinates': coordinates,
-            },
-            'properties': properties,
-        }
-        return jsonify(geojson)
-    except Exception as e:
-        # Scrub the exception message from the response — raw SQL
-        # fragments / file paths could leak in error.message and
-        # surface to any browser that happens to be on the AP.
-        # Full traceback is preserved in the server log.
-        logger.exception("Failed to query trip route: %s", e)
-        return jsonify({'error': 'internal error'}), 500
-
-
-@mapping_bp.route("/api/trip/<int:trip_id>/telemetry")
-def api_trip_telemetry(trip_id):
-    """Return cold telemetry (steering/brake/accel/gear/blinker) for
-    every waypoint in ``trip_id`` keyed by waypoint id.
-
-    Issue #184 Wave 3 — Phase D companion to ``/api/trip/<id>/route``.
-    The map polyline endpoint returns hot columns only (lat/lon/
-    speed/heading/autopilot_state). When the user opens the in-clip
-    HUD overlay, the JS calls this endpoint once and merges the
-    cold payload into the existing waypoints array.
-
-    Response shape::
-
-        {
-            "trip_id": <int>,
-            "telemetry": {
-                "<waypoint_id>": {
-                    "id": <int>,
-                    "acceleration_x": <float|null>,
-                    "acceleration_y": <float|null>,
-                    "acceleration_z": <float|null>,
-                    "gear": <str|null>,
-                    "steering_angle": <float|null>,
-                    "brake_applied": <0|1>,
-                    "blinker_on_left": <0|1>,
-                    "blinker_on_right": <0|1>
-                },
-                ...
-            }
-        }
-
-    Empty ``telemetry`` is a valid response (parked-only trip).
-    """
-    from services.mapping_queries import query_trip_telemetry
-    try:
-        telem = query_trip_telemetry(MAPPING_DB_PATH, trip_id)
-        return jsonify({
-            'trip_id': trip_id,
-            'telemetry': {str(wp_id): row for wp_id, row in telem.items()},
-        })
-    except Exception as e:
-        # Scrub the exception message from the response — raw SQL
-        # fragments / file paths could leak in error.message. Full
-        # traceback is preserved in the server log.
-        logger.exception("Failed to query trip telemetry: %s", e)
-        return jsonify({'error': 'internal error'}), 500
 
 
 @mapping_bp.route("/api/waypoints-for-clip")
 def api_waypoints_for_clip():
-    """Look up waypoints matching a video clip path (or nearby clips in same trip)."""
+    """Look up waypoints matching a video clip path."""
     from services.mapping_queries import get_db_connection
 
     video_path = request.args.get('path', '')
@@ -182,56 +57,69 @@ def api_waypoints_for_clip():
 
     try:
         conn = get_db_connection(MAPPING_DB_PATH)
-        # First try exact match on the video_path
         rows = conn.execute(
-            """SELECT w.* FROM waypoints w
-               WHERE w.video_path = ? ORDER BY w.id""",
+            """SELECT * FROM waypoints
+               WHERE video_path = ? ORDER BY id""",
             (video_path,)
         ).fetchall()
-
-        if rows:
-            # Found — also get all waypoints from the same trip for full HUD.
-            # Sort by timestamp (id as tiebreaker): id-only ordering breaks
-            # when late-indexed videos or merged trips give waypoints non-
-            # monotonic ids relative to their timestamps. See
-            # mapping_queries.query_day_routes docstring for the full story.
-            trip_id = rows[0]['trip_id']
-            all_wps = conn.execute(
-                """SELECT * FROM waypoints WHERE trip_id = ?
-                   ORDER BY timestamp ASC, id ASC""",
-                (trip_id,)
-            ).fetchall()
-            conn.close()
-            return jsonify({'waypoints': [dict(r) for r in all_wps], 'trip_id': trip_id})
-
-        # No exact match — try matching by base path (without -front.mp4 suffix)
-        base = video_path.replace('-front.mp4', '').replace('-back.mp4', '')
-        rows = conn.execute(
-            """SELECT DISTINCT trip_id FROM waypoints
-               WHERE video_path LIKE ? LIMIT 1""",
-            (f'%{base}%',)
-        ).fetchall()
-
-        if rows:
-            trip_id = rows[0]['trip_id']
-            all_wps = conn.execute(
-                """SELECT * FROM waypoints WHERE trip_id = ?
-                   ORDER BY timestamp ASC, id ASC""",
-                (trip_id,)
-            ).fetchall()
-            conn.close()
-            return jsonify({'waypoints': [dict(r) for r in all_wps], 'trip_id': trip_id})
-
         conn.close()
-        return jsonify({'waypoints': []})
+        return jsonify({'waypoints': [dict(r) for r in rows]})
     except Exception as e:
         logger.error("Failed to look up waypoints for clip: %s", e)
         return jsonify({'waypoints': []})
 
 
+@mapping_bp.route("/api/waypoints/telemetry", methods=['POST'])
+def api_waypoints_telemetry():
+    """Return cold telemetry for a list of waypoint IDs."""
+    from services.mapping_queries import get_db_connection
+
+    ids = request.get_json(silent=True)
+    if not ids or not isinstance(ids, dict) or 'ids' not in ids:
+        return jsonify({'telemetry': {}})
+    waypoint_ids = ids.get('ids', [])
+    if not waypoint_ids or not isinstance(waypoint_ids, list):
+        return jsonify({'telemetry': {}})
+
+    try:
+        conn = get_db_connection(MAPPING_DB_PATH)
+        placeholders = ','.join('?' * len(waypoint_ids))
+        rows = conn.execute(
+            f"SELECT * FROM waypoints_cold WHERE id IN ({placeholders})",
+            waypoint_ids,
+        ).fetchall()
+        conn.close()
+        telemetry = {str(r['id']): dict(r) for r in rows}
+        return jsonify({'telemetry': telemetry})
+    except Exception as e:
+        logger.error("Failed to fetch waypoint telemetry: %s", e)
+        return jsonify({'telemetry': {}})
+
+
 # ---------------------------------------------------------------------------
 # Event APIs
 # ---------------------------------------------------------------------------
+
+@mapping_bp.route("/api/event-days")
+def api_event_days():
+    """Return dates that have detected events for the day navigator."""
+    from services.mapping_queries import get_db_connection
+
+    try:
+        conn = get_db_connection(MAPPING_DB_PATH)
+        rows = conn.execute(
+            """SELECT substr(timestamp, 1, 10) AS date,
+                      COUNT(*) AS event_count,
+                      SUM(CASE WHEN event_type = 'sentry' THEN 1 ELSE 0 END) AS sentry_count
+               FROM detected_events
+               GROUP BY date ORDER BY date DESC LIMIT 365"""
+        ).fetchall()
+        conn.close()
+        return jsonify({'days': [dict(r) for r in rows]})
+    except Exception as e:
+        logger.error("Failed to query event days: %s", e)
+        return jsonify({'days': []})
+
 
 @mapping_bp.route("/api/events")
 def api_events():
@@ -294,275 +182,9 @@ def api_events():
 
 
 # ---------------------------------------------------------------------------
-# Day-based APIs (powering the day navigator on the map page)
+# Statistics APIs
 # ---------------------------------------------------------------------------
 
-# Default trip-distance threshold matches /api/trips so the day card's
-# trip count never advertises trips the map omits. 50 m hides parking-
-# lot blips and stationary sentry recordings.
-_DEFAULT_DAY_MIN_DISTANCE_KM = 0.05
-# Maximum days returned by /api/days. The day navigator scrolls
-# locally; 365 covers a full year of indexed history. Higher values
-# would just bloat the initial payload without changing the UI.
-_DAYS_LIMIT_MAX = 365
-_DAYS_LIMIT_DEFAULT = 60
-
-
-@mapping_bp.route("/api/days")
-def api_days():
-    """Return a list of days that have trips and/or detected events.
-
-    Powers the day navigator (prev/next chevrons + day card stats).
-    Each day row carries enough metadata to render the card without
-    a follow-up call:
-
-      * ``date`` (``YYYY-MM-DD``)
-      * ``trip_count`` / ``total_distance_km`` — trips meeting
-        ``min_distance`` (default 50 m, matches ``/api/trips``)
-      * ``event_count`` / ``sentry_count``
-      * ``first_start`` / ``last_end`` (NULL on event-only days)
-
-    Query params:
-      * ``limit`` — max days to return (default 60, capped at 365)
-      * ``min_distance`` — trip distance threshold in km
-        (default 0.05 = 50 m). Pass 0 to include parking blips.
-    """
-    from services.mapping_queries import query_days
-
-    limit = request.args.get('limit', _DAYS_LIMIT_DEFAULT, type=int)
-    if limit is None or limit <= 0:
-        limit = _DAYS_LIMIT_DEFAULT
-    limit = min(limit, _DAYS_LIMIT_MAX)
-
-    min_distance_km = request.args.get(
-        'min_distance', _DEFAULT_DAY_MIN_DISTANCE_KM, type=float
-    )
-    if min_distance_km is None or min_distance_km < 0:
-        min_distance_km = _DEFAULT_DAY_MIN_DISTANCE_KM
-
-    try:
-        days = query_days(MAPPING_DB_PATH, limit=limit,
-                          min_distance_km=min_distance_km)
-        return jsonify({'days': days})
-    except Exception as e:  # noqa: BLE001
-        logger.error("Failed to query days: %s", e)
-        return jsonify({'error': str(e)}), 500
-
-
-@mapping_bp.route("/api/day/<date>/routes")
-def api_day_routes(date):
-    """Return all trip routes that started on ``date`` (``YYYY-MM-DD``).
-
-    Powers the multi-trip overlay for a selected day. One server
-    round trip returns every trip's metadata + waypoints in a single
-    JSON payload, so the client doesn't fan out to per-trip
-    ``/api/trip/<id>/route`` calls (which would be expensive on a
-    multi-trip day with hundreds of waypoints each).
-
-    Response shape::
-
-        {
-          "date": "2026-05-04",
-          "trips": [
-            {
-              "trip_id": int,
-              "start_time", "end_time",
-              "start_lat", "start_lon", "end_lat", "end_lon",
-              "distance_km", "duration_seconds",
-              "source_folder",
-              "waypoints": [{"id", "lat", "lon", "speed_mps",
-                             "video_path", ...}, ...]
-            },
-            ...
-          ]
-        }
-    """
-    from services.mapping_queries import query_day_routes
-
-    if not _DATE_RE.match(date):
-        return jsonify({'error': 'date must be YYYY-MM-DD'}), 400
-
-    min_distance_km = request.args.get(
-        'min_distance', _DEFAULT_DAY_MIN_DISTANCE_KM, type=float
-    )
-    if min_distance_km is None or min_distance_km < 0:
-        min_distance_km = _DEFAULT_DAY_MIN_DISTANCE_KM
-
-    try:
-        result = query_day_routes(MAPPING_DB_PATH, date,
-                                  min_distance_km=min_distance_km)
-        # Normalize ArchivedClips video paths so the client can
-        # use them as relative URLs without further parsing — same
-        # contract as /api/trip/<id>/route.
-        for trip in result.get('trips', []):
-            for wp in trip.get('waypoints', []):
-                vp = wp.get('video_path') or ''
-                if vp and 'ArchivedClips' in vp:
-                    basename = vp.rsplit('/', 1)[-1] if '/' in vp else vp
-                    wp['video_path'] = f'ArchivedClips/{basename}'
-        result['date'] = date
-        return jsonify(result)
-    except Exception as e:  # noqa: BLE001
-        logger.error("Failed to query day routes: %s", e)
-        return jsonify({'error': str(e)}), 500
-
-
-@mapping_bp.route("/api/trips/playable")
-def api_trips_playable():
-    """Return which trips on a given day still have playable video on disk.
-
-    Powers the disambiguation popup's ghost-trip filter (issue #77):
-    a trip whose ``waypoints.video_path`` rows reference clips that
-    Tesla has rotated out of RecentClips (and that the archive job
-    didn't copy in time) should not appear in the chooser, because
-    picking one yields an unhelpful "No video available" toast.
-
-    The check is per-trip — a trip is "playable" iff at least one of
-    its waypoints' video paths resolves to a real file on disk via
-    the same fallback rules :func:`videos.stream_video` uses
-    (RecentClips → ArchivedClips). Per-day results are cached
-    server-side for 60 s; subsequent calls within that window are
-    served from memory.
-
-    Query params:
-      * ``date`` — ISO ``YYYY-MM-DD`` (required).
-
-    Response shape::
-
-        {
-          "date": "2026-05-07",
-          "trips": {"62": false, "63": true, ...}
-        }
-
-    Trip ids are JSON-stringified because JSON object keys must be
-    strings; the client coerces them back to numbers.
-    """
-    from services.mapping_queries import playable_trips_for_date
-
-    date = request.args.get('date', '')
-    if not _DATE_RE.match(date):
-        return jsonify({'error': 'date must be YYYY-MM-DD'}), 400
-
-    try:
-        from config import ARCHIVE_DIR, ARCHIVE_ENABLED
-        archive_dir = ARCHIVE_DIR if ARCHIVE_ENABLED else None
-    except ImportError:
-        archive_dir = None
-
-    teslacam_path = get_teslacam_path()
-
-    try:
-        result = playable_trips_for_date(
-            MAPPING_DB_PATH, date,
-            teslacam_path=teslacam_path,
-            archive_dir=archive_dir,
-        )
-    except Exception as e:  # noqa: BLE001
-        logger.error("Failed to compute playable trips for %s: %s",
-                     date, e)
-        return jsonify({'error': str(e)}), 500
-
-    # Stringify keys for JSON compatibility; the client expects this
-    # and coerces them back via Number() / parseInt().
-    return jsonify({
-        'date': date,
-        'trips': {str(k): v for k, v in result.items()},
-    })
-
-
-# Maximum simplified waypoints per trip in /api/all-routes. With
-# RDP-based simplification (the default for query_all_routes_simplified)
-# this is a safety cap that pathological zigzag trips would hit;
-# typical road trips return 10-50 points. The hard cap exists to
-# prevent a malicious caller from forcing an unbounded payload.
-_DEFAULT_ALL_ROUTES_MAX_POINTS = 200
-_ALL_ROUTES_MAX_POINTS_CAP = 1000
-
-
-@mapping_bp.route("/api/all-routes")
-def api_all_routes():
-    """Return a shape-aware simplified overview of every indexed trip.
-
-    Powers the "All time" overlay on the map page. Each trip is
-    represented by its metadata (start/end coords, distance,
-    duration) plus a simplified waypoint list — the service uses
-    Ramer-Douglas-Peucker simplification (default 8 m tolerance)
-    so road corners are preserved and straight stretches collapse
-    naturally. ``max_points`` (default 200, hard cap 1000) is a
-    safety net for pathologically zigzag trips. The default
-    ``min_distance`` matches /api/trips and /api/day/<date>/routes
-    so the All time overlay never advertises trips that other views
-    hide as parking-lot blips.
-
-    Each trip carries the ``date`` (YYYY-MM-DD) it started so the
-    client can drill into that day on click without an extra
-    round trip.
-
-    Response shape::
-
-        {
-          "trips": [
-            {
-              "trip_id": int,
-              "date": "YYYY-MM-DD",
-              "start_time", "end_time",
-              "start_lat", "start_lon", "end_lat", "end_lon",
-              "distance_km", "duration_seconds",
-              "waypoints": [{"lat", "lon", "speed_mps"}, ...]
-            },
-            ...
-          ]
-        }
-    """
-    from services.mapping_queries import query_all_routes_simplified
-
-    min_distance_km = request.args.get(
-        'min_distance', _DEFAULT_DAY_MIN_DISTANCE_KM, type=float
-    )
-    if min_distance_km is None or min_distance_km < 0:
-        min_distance_km = _DEFAULT_DAY_MIN_DISTANCE_KM
-
-    max_points = request.args.get(
-        'max_points', _DEFAULT_ALL_ROUTES_MAX_POINTS, type=int
-    )
-    if max_points is None or max_points < 2:
-        max_points = _DEFAULT_ALL_ROUTES_MAX_POINTS
-    if max_points > _ALL_ROUTES_MAX_POINTS_CAP:
-        max_points = _ALL_ROUTES_MAX_POINTS_CAP
-
-    try:
-        trips = query_all_routes_simplified(
-            MAPPING_DB_PATH,
-            min_distance_km=min_distance_km,
-            max_points_per_trip=max_points,
-        )
-        # Fire-and-forget: nudge the stale-scan so map views built
-        # from a fresh process see any orphans cleaned up within a
-        # few seconds. Debounced to once per 10 min, so subsequent
-        # map loads incur no extra work. Issue #75.
-        try:
-            # Lazy import: services.mapping_service indirectly imports modules
-            # that import this blueprint, so a top-level import would create
-            # a circular dependency at app start-up. Python caches the module
-            # after the first call so this is effectively free on subsequent
-            # invocations.
-            from services.mapping_service import trigger_stale_scan_now
-            trigger_stale_scan_now(
-                MAPPING_DB_PATH,
-                get_teslacam_path,
-                source='map_load',
-            )
-        except Exception:  # noqa: BLE001
-            pass  # Never let the trigger break the map endpoint.
-        return jsonify({'trips': trips})
-    except Exception as e:  # noqa: BLE001
-        logger.error("Failed to query all routes: %s", e)
-        return jsonify({'error': str(e)}), 500
-
-
-# ---------------------------------------------------------------------------
-# Stats & Indexer APIs
-# ---------------------------------------------------------------------------
 
 @mapping_bp.route("/api/stats")
 def api_stats():
@@ -650,7 +272,7 @@ def api_index_rebuild():
     """Destructively rebuild the entire map index (advanced).
 
     Drops every row from ``indexed_files``, ``waypoints``,
-    ``detected_events``, ``trips``, and ``indexing_queue``, then
+    ``detected_events``, and ``indexing_queue``, then
     re-walks the TeslaCam tree to enqueue every front-camera clip.
     Use only when parsers/thresholds change and existing data needs
     to be reparsed from scratch.
@@ -701,7 +323,6 @@ def api_index_rebuild():
         with sqlite3.connect(MAPPING_DB_PATH) as conn:
             conn.execute("DELETE FROM waypoints")
             conn.execute("DELETE FROM detected_events")
-            conn.execute("DELETE FROM trips")
             conn.execute("DELETE FROM indexed_files")
             conn.commit()
         cleared = clear_all_queue(MAPPING_DB_PATH)

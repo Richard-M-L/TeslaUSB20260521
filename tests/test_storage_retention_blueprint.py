@@ -462,7 +462,7 @@ class TestApiReclaimStationaryRecent:
                 'deleted_count': 12, 'freed_bytes': 25_000_000,
                 'scanned': 100, 'kept_too_new': 4,
                 'kept_has_event_counterpart': 1, 'kept_unindexed': 0,
-                'kept_has_gps': 0, 'min_age_hours': 1,
+                'kept_has_waypoints': 0, 'min_age_hours': 1,
                 'duration_seconds': 0.8,
             },
         ):
@@ -529,7 +529,7 @@ class TestApiReclaimStationaryRecent:
             return {
                 'deleted_count': 0, 'freed_bytes': 0, 'scanned': 0,
                 'kept_too_new': 0, 'kept_has_event_counterpart': 0,
-                'kept_unindexed': 0, 'kept_has_gps': 0,
+                'kept_unindexed': 0, 'kept_has_waypoints': 0,
                 'min_age_hours': kwargs.get('min_age_hours', -1),
                 'duration_seconds': 0.0,
             }
@@ -551,7 +551,7 @@ class TestApiReclaimStationaryRecent:
             return {
                 'deleted_count': 0, 'freed_bytes': 0, 'scanned': 0,
                 'kept_too_new': 0, 'kept_has_event_counterpart': 0,
-                'kept_unindexed': 0, 'kept_has_gps': 0,
+                'kept_unindexed': 0, 'kept_has_waypoints': 0,
                 'min_age_hours': kwargs.get('min_age_hours', -1),
                 'duration_seconds': 0.0,
             }
@@ -574,7 +574,7 @@ class TestApiReclaimStationaryRecent:
             return {
                 'deleted_count': 0, 'freed_bytes': 0, 'scanned': 0,
                 'kept_too_new': 0, 'kept_has_event_counterpart': 0,
-                'kept_unindexed': 0, 'kept_has_gps': 0,
+                'kept_unindexed': 0, 'kept_has_waypoints': 0,
                 'min_age_hours': kwargs.get('min_age_hours', -1),
                 'duration_seconds': 0.0,
             }
@@ -624,7 +624,7 @@ class TestApiReclaimStationaryRecent:
             return_value={
                 'deleted_count': 0, 'freed_bytes': 0, 'scanned': 0,
                 'kept_too_new': 0, 'kept_has_event_counterpart': 0,
-                'kept_unindexed': 0, 'kept_has_gps': 0,
+                'kept_unindexed': 0, 'kept_has_waypoints': 0,
                 'min_age_hours': 1, 'duration_seconds': 0.0,
             },
         ):

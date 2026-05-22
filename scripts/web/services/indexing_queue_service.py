@@ -559,7 +559,7 @@ def complete_queue_item(db_path: str, canonical_key_value: str,
     """Remove a row after a terminal-outcome processing.
 
     Used for INDEXED, ALREADY_INDEXED, DUPLICATE_UPGRADED,
-    NO_GPS_RECORDED, NOT_FRONT_CAMERA, FILE_MISSING. Returns True if a
+    NO_MOVEMENT_RECORDED, NOT_FRONT_CAMERA, FILE_MISSING. Returns True if a
     row was deleted.
 
     If ``claimed_by`` and ``claimed_at`` are provided, the delete is

@@ -89,14 +89,14 @@ class IndexOutcome(Enum):
     the queue row, retry later (with backoff or after the file ages), or
     purge stale DB rows. Every outcome maps to exactly one queue action,
     eliminating the historical ``(0, 0)`` ambiguity that meant any of
-    seven different things (parse error, no GPS, too new, missing file,
+    seven different things (parse error, no movement, too new, missing file,
     wrong camera, dedup skip, ...) and was unsafe for retry decisions.
     """
 
     INDEXED = 'indexed'                        # New waypoints/events written
     ALREADY_INDEXED = 'already_indexed'        # Canonical key present with data
     DUPLICATE_UPGRADED = 'duplicate_upgraded'  # RecentClips→ArchivedClips upgrade
-    NO_GPS_RECORDED = 'no_gps_recorded'        # File parsed; no GPS; tracked
+    NO_MOVEMENT_RECORDED = 'no_movement_recorded'  # File parsed; no movement; tracked
     NOT_FRONT_CAMERA = 'not_front_camera'      # Skip non-front-cam clip
     TOO_NEW = 'too_new'                        # mtime < 120s ago — retry later
     FILE_MISSING = 'file_missing'              # File no longer exists; purge DB
@@ -110,7 +110,7 @@ _TERMINAL_OUTCOMES = frozenset({
     IndexOutcome.INDEXED,
     IndexOutcome.ALREADY_INDEXED,
     IndexOutcome.DUPLICATE_UPGRADED,
-    IndexOutcome.NO_GPS_RECORDED,
+    IndexOutcome.NO_MOVEMENT_RECORDED,
     IndexOutcome.NOT_FRONT_CAMERA,
     IndexOutcome.FILE_MISSING,
 })
@@ -202,221 +202,6 @@ def _with_db_retry(fn: Callable) -> Callable:
 # continue to work unchanged. New code should import from
 # ``services.mapping_migrations`` directly.
 
-
-# Default trip gap, also used by the migration. Kept here so the migration
-# can run before any per-call ``trip_gap_minutes`` argument is available.
-_TRIP_GAP_MINUTES_DEFAULT = 5
-
-# Safety bound on the post-insert merge loop. The migration uses 10000;
-# match it so the runtime helper can recover from severe accumulated
-# fragmentation (e.g. after a long indexer outage where many small
-# trip fragments built up). Hitting this bound indicates a pathological
-# data set worth investigating.
-_MERGE_MAX_ITERATIONS = 10000
-
-
-def _merge_adjacent_trips_for(conn: sqlite3.Connection,
-                              anchor_trip_id: int,
-                              gap_seconds: float) -> int:
-    """Merge any other trip whose [start_time, end_time] window is within
-    ``gap_seconds`` of the anchor's window. The lower trip id wins so
-    the survivor is stable and references stay valid.
-
-    This is the runtime defense against trip fragmentation when the
-    indexer processes a drive's clips out of order. The matching SQL in
-    :func:`_index_video` picks one trip per insert; this helper runs
-    afterwards and stitches together any trips the new clip's waypoints
-    bridged. Mirrors the v2→v3 migration's merge phase but is scoped to
-    one anchor's neighbourhood per call so it costs only a handful of
-    queries per indexed file.
-
-    Returns the surviving trip id (which equals ``anchor_trip_id`` when
-    anchor is the lowest-id trip in its merged cluster, otherwise the
-    smaller id of the merge pair).
-
-    Important: the caller is responsible for calling ``conn.commit()``
-    after this returns. The helper writes through the connection's
-    current transaction so insert + merge + stats recompute remain
-    atomic — readers see either the pre-insert state or the fully
-    merged state, never a half-merged window.
-
-    Foreign-key safety: the schema declares
-    ``trip_id REFERENCES trips(id) ON DELETE CASCADE`` on both
-    ``waypoints`` and ``detected_events``, so this helper MUST update
-    the child rows BEFORE deleting the dropped trip — otherwise the
-    cascade would destroy waypoints we wanted to preserve.
-    """
-    survivor = anchor_trip_id
-
-    for _ in range(_MERGE_MAX_ITERATIONS):
-        # Refresh the survivor's bounds from waypoints. The bounds may
-        # have changed in two ways since the last iteration: the caller
-        # just inserted new waypoints, or the previous loop iteration
-        # absorbed another trip's waypoints. Without this refresh, a
-        # chain merge (A ↔ B ↔ C) would stop after one step because
-        # the survivor's stale ``end_time`` does not reach C.
-        bounds = conn.execute(
-            "SELECT MIN(timestamp) AS s, MAX(timestamp) AS e "
-            "FROM waypoints WHERE trip_id = ?",
-            (survivor,),
-        ).fetchone()
-        if not bounds or bounds['s'] is None:
-            return survivor
-        conn.execute(
-            "UPDATE trips SET start_time = ?, end_time = ? WHERE id = ?",
-            (bounds['s'], bounds['e'], survivor),
-        )
-
-        # Find the lowest-id mergeable neighbour. Same window logic as
-        # the matching SQL in _index_video and the migration:
-        #   neighbour.start - survivor.end ≤ gap   (neighbour after)
-        #   survivor.start - neighbour.end ≤ gap   (neighbour before)
-        # Negative values (overlap) also satisfy ≤ gap. Order by id so
-        # we always pick the smallest mergeable neighbour first; the
-        # absolute pair we merge is then (min(survivor, candidate),
-        # max(survivor, candidate)).
-        #
-        # Integer-second arithmetic via ``strftime('%s', ...)`` is used
-        # instead of ``(julianday(a) - julianday(b)) * 86400`` because
-        # the latter has floating-point error: a true 300-second gap
-        # can yield 300.000022 and fail the ``<= 300`` boundary check,
-        # silently leaving phantom-fragmented trips unmerged. The
-        # strftime form is precise to one second, which is safely
-        # within the 5-minute trip-gap semantic tolerance.
-        candidate = conn.execute(
-            """
-            SELECT id FROM trips
-            WHERE id != :survivor
-              AND start_time IS NOT NULL AND end_time IS NOT NULL
-              AND (CAST(strftime('%s', start_time) AS INTEGER)
-                   - CAST(strftime('%s', :end_t) AS INTEGER)) <= :gap
-              AND (CAST(strftime('%s', :start_t) AS INTEGER)
-                   - CAST(strftime('%s', end_time) AS INTEGER)) <= :gap
-            ORDER BY id
-            LIMIT 1
-            """,
-            {'survivor': survivor,
-             'start_t': bounds['s'], 'end_t': bounds['e'],
-             'gap': gap_seconds},
-        ).fetchone()
-        if not candidate:
-            return survivor
-
-        keep_id = min(survivor, candidate['id'])
-        drop_id = max(survivor, candidate['id'])
-
-        # Update children first, then delete the parent. Reversing this
-        # order would trip the ON DELETE CASCADE and silently destroy
-        # the very rows we are trying to preserve.
-        conn.execute(
-            "UPDATE waypoints SET trip_id = ? WHERE trip_id = ?",
-            (keep_id, drop_id),
-        )
-        conn.execute(
-            "UPDATE detected_events SET trip_id = ? WHERE trip_id = ?",
-            (keep_id, drop_id),
-        )
-        conn.execute("DELETE FROM trips WHERE id = ?", (drop_id,))
-        survivor = keep_id
-
-    raise RuntimeError(
-        f"_merge_adjacent_trips_for: exceeded {_MERGE_MAX_ITERATIONS} "
-        "iterations — possible infinite loop or pathological data"
-    )
-
-
-def _merge_all_adjacent_trip_pairs(conn: sqlite3.Connection,
-                                    gap_seconds: float) -> int:
-    """Sweep the whole ``trips`` table and merge every pair whose
-    windows are within ``gap_seconds`` of each other.
-
-    Used by:
-      * the v2→v3 migration (cleans up duplicate trips from earlier
-        indexer bugs);
-      * the v8→v9 migration (one-shot repair of phantom-fragmented
-        trips left over from the matching-SQL boundary bug);
-      * future startup repair passes.
-
-    Always uses integer-epoch arithmetic via ``strftime('%s', ...)``
-    instead of ``(julianday(a) - julianday(b)) * 86400`` because the
-    latter has floating-point error that silently leaves true
-    ``gap_seconds``-apart pairs unmerged (see ``_merge_adjacent_trips_for``
-    for the in-depth explanation).
-
-    Foreign-key safety: updates ``waypoints`` and ``detected_events``
-    BEFORE deleting the dropped trip, since both tables declare
-    ``ON DELETE CASCADE`` on ``trip_id``.
-
-    Returns the number of merge operations performed. The caller is
-    responsible for ``conn.commit()``.
-
-    Raises ``RuntimeError`` if more than ``_MERGE_MAX_ITERATIONS`` pairs
-    are merged — a safety bound that triggers the migration's SAVEPOINT
-    rollback rather than silently continuing forever on pathological
-    data.
-    """
-    merged = 0
-    for _ in range(_MERGE_MAX_ITERATIONS):
-        pair = conn.execute(
-            """SELECT a.id AS keep_id, b.id AS drop_id
-               FROM trips a
-               JOIN trips b
-                 ON a.id < b.id
-                AND a.start_time IS NOT NULL AND a.end_time IS NOT NULL
-                AND b.start_time IS NOT NULL AND b.end_time IS NOT NULL
-                AND (CAST(strftime('%s', b.start_time) AS INTEGER)
-                     - CAST(strftime('%s', a.end_time) AS INTEGER)) <= ?
-                AND (CAST(strftime('%s', a.start_time) AS INTEGER)
-                     - CAST(strftime('%s', b.end_time) AS INTEGER)) <= ?
-               LIMIT 1""",
-            (gap_seconds, gap_seconds),
-        ).fetchone()
-        if not pair:
-            return merged
-        keep_id, drop_id = pair['keep_id'], pair['drop_id']
-        conn.execute(
-            "UPDATE waypoints SET trip_id = ? WHERE trip_id = ?",
-            (keep_id, drop_id),
-        )
-        conn.execute(
-            "UPDATE detected_events SET trip_id = ? WHERE trip_id = ?",
-            (keep_id, drop_id),
-        )
-        # Refresh the survivor's bounds so the next iteration considers
-        # the merged window when looking for further mergeable pairs.
-        bounds = conn.execute(
-            "SELECT MIN(timestamp) AS s, MAX(timestamp) AS e "
-            "FROM waypoints WHERE trip_id = ?",
-            (keep_id,),
-        ).fetchone()
-        if bounds and bounds['s'] is not None:
-            conn.execute(
-                "UPDATE trips SET start_time = ?, end_time = ? "
-                "WHERE id = ?",
-                (bounds['s'], bounds['e'], keep_id),
-            )
-        conn.execute("DELETE FROM trips WHERE id = ?", (drop_id,))
-        merged += 1
-
-    raise RuntimeError(
-        f"_merge_all_adjacent_trip_pairs: exceeded "
-        f"{_MERGE_MAX_ITERATIONS} iterations — possible infinite loop "
-        "or pathological duplicate set"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Event Detection Rules
-# ---------------------------------------------------------------------------
-
-# Default thresholds (can be overridden via config.yaml mapping.event_detection)
-DEFAULT_THRESHOLDS = {
-    'harsh_brake_threshold': -4.0,        # m/s² (longitudinal)
-    'emergency_brake_threshold': -7.0,
-    'hard_accel_threshold': 3.5,
-    'sharp_turn_lateral_g': 4.0,          # m/s² (lateral)
-    'speed_limit_mps': 35.76,             # ~80 mph
-}
 
 
 def _detect_events(
@@ -563,39 +348,6 @@ def _debounce_events(events: list, window_seconds: float = 5.0) -> list:
         last_by_type[key] = ts
 
     return result
-
-
-# ---------------------------------------------------------------------------
-# Haversine distance
-# ---------------------------------------------------------------------------
-
-def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Calculate great-circle distance between two GPS points in km."""
-    R = 6371.0  # Earth radius in km
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = (math.sin(dlat / 2) ** 2
-         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2))
-         * math.sin(dlon / 2) ** 2)
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-
-# ---------------------------------------------------------------------------
-# Polyline gap detection moved to services.mapping_queries (Phase 3c.3, #100)
-# ---------------------------------------------------------------------------
-
-
-
-
-# ---------------------------------------------------------------------------
-# Indexer status bridge (legacy)
-# ---------------------------------------------------------------------------
-#
-# The original indexer was a single long-lived thread driven by a global
-# ``_status`` dict. It has been replaced by ``services.indexing_worker``,
-# which uses an SQLite-backed queue. The two helpers below are kept as
-# thin compatibility shims for any caller that still hits the old API
-# (currently just ``get_stats`` for ``/api/stats``).
 
 
 def get_indexer_status() -> dict:
@@ -1174,11 +926,10 @@ def _infer_sentry_event(
 
     conn.execute(
         """INSERT INTO detected_events
-           (trip_id, timestamp, lat, lon, event_type, severity,
+           (timestamp, lat, lon, event_type, severity,
             description, video_path, frame_offset, metadata)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            None,  # not associated with a trip
             file_timestamp,
             lat,
             lon,
@@ -1206,7 +957,6 @@ def _index_video(
     teslacam_root: str,
     sample_rate: int,
     thresholds: dict,
-    trip_gap_minutes: int,
 ) -> IndexResult:
     """Index a single video file: extract SEI, detect events, store in DB.
 
@@ -1356,7 +1106,7 @@ def _index_video(
     # evicted from cache by the time the indexer runs minutes later).
     waypoint_dicts = []
     sei_count = 0
-    no_gps_count = 0
+    no_movement_count = 0
     # We already loaded ``sidecar`` above for _resolve_recording_time.
     # Apply the sample_rate check here: if the cached sidecar was
     # written at a different sampling than the indexer wants, we
@@ -1378,13 +1128,13 @@ def _index_video(
         if sidecar_for_messages is not None:
             logger.info(
                 "loaded sidecar parse for %s "
-                "(%d GPS messages, sample_rate=%d)",
+                "(%d movement messages, sample_rate=%d)",
                 rel_path,
                 len(sidecar_for_messages.messages),
                 sidecar_for_messages.sample_rate,
             )
             sei_count = sidecar_for_messages.sei_count
-            no_gps_count = sidecar_for_messages.no_gps_count
+            no_movement_count = sidecar_for_messages.no_movement_count
             msg_iter = sidecar_for_messages.messages
         else:
             logger.info(
@@ -1399,15 +1149,15 @@ def _index_video(
         for msg in msg_iter:
             if sidecar_for_messages is None:
                 # Sidecar path already accounted for sei_count /
-                # no_gps_count + filtered out no-GPS messages, so the
-                # tally is only meaningful on the mmap fallback path.
+                # no_movement_count + filtered out stationary messages,
+                # so the tally is only meaningful on the mmap fallback path.
                 sei_count += 1
-                if not msg.has_gps:
-                    no_gps_count += 1
+                if not msg.has_movement:
+                    no_movement_count += 1
                     continue
             # NOTE: sidecar_for_messages.messages is pre-filtered to
-            # GPS-bearing only (see ``write_sei_sidecar``), so the
-            # ``has_gps`` check above is redundant when
+            # movement-bearing only (see ``write_sei_sidecar``), so the
+            # ``has_movement`` check above is redundant when
             # ``sidecar_for_messages is not None``.
 
             # Compute absolute timestamp from file timestamp + frame offset
@@ -1450,81 +1200,23 @@ def _index_video(
         if sei_count == 0:
             logger.info("No SEI messages found in %s", rel_path)
         else:
-            logger.info("%s: %d SEI messages but 0 had GPS (%d checked)",
-                        rel_path, sei_count, no_gps_count)
+            logger.info("%s: %d SEI messages but 0 with movement (%d checked)",
+                        rel_path, sei_count, no_movement_count)
 
-        # For Sentry/Saved clips with no GPS, create an event using the
-        # accurate Tesla event.json (preferred) or nearest waypoint as fallback
+        # For Sentry/Saved clips with no movement data, create an event using
+        # Tesla event.json (preferred) or nearest waypoint as fallback
         if 'SentryClips' in rel_path or 'SavedClips' in rel_path:
             inferred = _infer_sentry_event(conn, rel_path, file_timestamp,
                                             teslacam_root=teslacam_root)
             if inferred:
                 # 1 inferred event written; treat as indexed for queue purposes.
                 return IndexResult(IndexOutcome.INDEXED, waypoints=0, events=1)
-        return IndexResult(IndexOutcome.NO_GPS_RECORDED)
+        return IndexResult(IndexOutcome.NO_MOVEMENT_RECORDED)
 
     # Determine source folder
     parts = rel_path.replace('\\', '/').split('/')
     source_folder = parts[0] if parts else 'Unknown'
 
-    # Find or create trip — match on time proximity, regardless of source_folder.
-    # Earlier code filtered by source_folder, which fragmented trips when
-    # the same drive was ingested from RecentClips vs ArchivedClips, and
-    # picked the wrong trip when videos were indexed out of order.
-    #
-    # ORDER BY: pick the trip with the smallest temporal gap to the new
-    # clip (0 for any trip whose window overlaps the new clip's range).
-    # An earlier "ORDER BY ABS(new_start - existing.start)" tie-breaker
-    # caused phantom duplicate trips in production: when the new clip
-    # fell BETWEEN two existing trips, that ranking could prefer the
-    # later trip simply because its start_time was numerically closer
-    # to the new clip's start (even though the clip should clearly
-    # extend the earlier trip). The new ranking always picks the trip
-    # whose interval the new clip actually adjoins. The post-insert
-    # _merge_adjacent_trips_for is still called as defense in depth in
-    # case the chosen trip is itself adjacent to another.
-    first_wp = waypoint_dicts[0]
-    last_wp = waypoint_dicts[-1]
-    new_start = first_wp['timestamp']
-    new_end = last_wp['timestamp']
-    gap_seconds = trip_gap_minutes * 60
-
-    existing_trip = conn.execute(
-        """
-        SELECT id FROM trips
-        WHERE start_time IS NOT NULL AND end_time IS NOT NULL
-          AND (CAST(strftime('%s', :ns) AS INTEGER)
-               - CAST(strftime('%s', end_time) AS INTEGER)) <= :gap
-          AND (CAST(strftime('%s', start_time) AS INTEGER)
-               - CAST(strftime('%s', :ne) AS INTEGER)) <= :gap
-        ORDER BY
-          CASE
-            WHEN CAST(strftime('%s', end_time) AS INTEGER)
-                 < CAST(strftime('%s', :ns) AS INTEGER)
-              THEN CAST(strftime('%s', :ns) AS INTEGER)
-                   - CAST(strftime('%s', end_time) AS INTEGER)
-            WHEN CAST(strftime('%s', start_time) AS INTEGER)
-                 > CAST(strftime('%s', :ne) AS INTEGER)
-              THEN CAST(strftime('%s', start_time) AS INTEGER)
-                   - CAST(strftime('%s', :ne) AS INTEGER)
-            ELSE 0
-          END ASC,
-          id ASC
-        LIMIT 1
-        """,
-        {'ns': new_start, 'ne': new_end, 'gap': gap_seconds},
-    ).fetchone()
-    trip_id = existing_trip['id'] if existing_trip else None
-
-    if trip_id is None:
-        # Create new trip
-        cursor = conn.execute(
-            """INSERT INTO trips (start_time, start_lat, start_lon, source_folder, indexed_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (first_wp['timestamp'], first_wp['lat'], first_wp['lon'],
-             source_folder, datetime.now(timezone.utc).isoformat())
-        )
-        trip_id = cursor.lastrowid
 
     # Insert waypoints — issue #184 Wave 3 — Phase D split.
     # Hot columns go to ``waypoints``; if any cold field carries a
@@ -1548,15 +1240,15 @@ def _index_video(
     else:
         hot_sql = (
             "INSERT INTO waypoints "
-            "(trip_id, timestamp, lat, lon, heading, speed_mps, "
+            "(timestamp, lat, lon, heading, speed_mps, "
             " autopilot_state, video_path, frame_offset) VALUES "
-            + ",".join(["(?, ?, ?, ?, ?, ?, ?, ?, ?)"] * len(waypoint_dicts))
+            + ",".join(["(?, ?, ?, ?, ?, ?, ?, ?)"] * len(waypoint_dicts))
             + " RETURNING id"
         )
         flat_values: List[Any] = []
         for wp in waypoint_dicts:
             flat_values.extend((
-                trip_id, wp['timestamp'], wp['lat'], wp['lon'],
+                wp['timestamp'], wp['lat'], wp['lon'],
                 wp['heading'], wp['speed_mps'], wp['autopilot_state'],
                 wp['video_path'], wp['frame_offset'],
             ))
@@ -1610,101 +1302,16 @@ def _index_video(
     if events:
         conn.executemany(
             """INSERT INTO detected_events
-               (trip_id, timestamp, lat, lon, event_type, severity,
+               (timestamp, lat, lon, event_type, severity,
                 description, video_path, frame_offset, metadata)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            [(trip_id, ev['timestamp'], ev['lat'], ev['lon'],
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [(ev['timestamp'], ev['lat'], ev['lon'],
               ev['event_type'], ev['severity'], ev['description'],
               ev['video_path'], ev['frame_offset'], ev.get('metadata'))
              for ev in events]
         )
 
-    # Defense-in-depth: merge any other trip whose window now adjoins
-    # (or overlaps) this trip's extent. The matching SQL above picks
-    # one trip per insert; if the new clip's waypoints bridged two
-    # existing trips, only the chosen one was extended and the other
-    # remained as a phantom fragment. _merge_adjacent_trips_for stitches
-    # them together using the same gap rule and returns the surviving
-    # id (which is preserved across calls because we always keep the
-    # lower id). All FK children are re-pointed before the dropped
-    # trip is deleted, so cascade does not destroy waypoints.
-    trip_id = _merge_adjacent_trips_for(conn, trip_id, gap_seconds)
 
-    # Recompute trip stats from the full waypoint set. The new video may
-    # extend the trip in either direction (forward OR backward in time when
-    # archive videos are indexed out of order), so we can't just append
-    # to the existing distance. Distance is summed per video file in
-    # frame/id order, because Tesla videos can overlap in time (e.g. saved
-    # clips alongside RecentClips); a global timestamp sort would interleave
-    # them and produce phantom GPS jumps.
-    bounds = conn.execute(
-        "SELECT MIN(timestamp) AS first_ts, MAX(timestamp) AS last_ts "
-        "FROM waypoints WHERE trip_id = ?",
-        (trip_id,),
-    ).fetchone()
-    if bounds and bounds['first_ts']:
-        first_ts, last_ts = bounds['first_ts'], bounds['last_ts']
-        first_row = conn.execute(
-            "SELECT lat, lon FROM waypoints WHERE trip_id = ? "
-            "AND timestamp = ? ORDER BY id LIMIT 1",
-            (trip_id, first_ts),
-        ).fetchone()
-        last_row = conn.execute(
-            "SELECT lat, lon FROM waypoints WHERE trip_id = ? "
-            "AND timestamp = ? ORDER BY id DESC LIMIT 1",
-            (trip_id, last_ts),
-        ).fetchone()
-        total_dist = 0.0
-        # Phase 5.1 (#102) — collapse the original N+1 (1 query for
-        # the distinct video list + 1 per video) into a single
-        # ORDER BY video_path, id pass.
-        #
-        # Distance is summed per video (we MUST NOT haversine across
-        # consecutive rows belonging to different videos): Tesla videos
-        # can overlap in time (saved clips alongside RecentClips), so
-        # a global ORDER BY timestamp would interleave them and produce
-        # phantom GPS jumps. Walking ORDER BY video_path, id gives the
-        # same per-video ordering the old per-video SELECT produced,
-        # and the explicit ``video_path`` column lets us reset between
-        # videos — equivalent semantics, one query instead of 1+N.
-        all_wps = conn.execute(
-            "SELECT video_path, lat, lon FROM waypoints "
-            "WHERE trip_id = ? AND video_path IS NOT NULL "
-            "ORDER BY video_path, id",
-            (trip_id,),
-        ).fetchall()
-        prev = None
-        prev_video = None
-        for w in all_wps:
-            video_path = w['video_path']
-            if prev is not None and video_path == prev_video:
-                total_dist += _haversine_km(
-                    prev['lat'], prev['lon'],
-                    w['lat'], w['lon'],
-                )
-            prev = w
-            prev_video = video_path
-        try:
-            dur = max(0, int((
-                datetime.fromisoformat(last_ts)
-                - datetime.fromisoformat(first_ts)
-            ).total_seconds()))
-        except (ValueError, TypeError):
-            dur = 0
-        conn.execute(
-            """UPDATE trips SET
-               start_time = ?, end_time = ?,
-               start_lat = ?, start_lon = ?,
-               end_lat = ?, end_lon = ?,
-               distance_km = ?, duration_seconds = ?
-               WHERE id = ?""",
-            (first_ts, last_ts,
-             first_row['lat'] if first_row else None,
-             first_row['lon'] if first_row else None,
-             last_row['lat'] if last_row else None,
-             last_row['lon'] if last_row else None,
-             total_dist, dur, trip_id),
-        )
 
     conn.commit()
     return IndexResult(
@@ -1720,7 +1327,6 @@ def index_single_file(
     teslacam_root: str,
     sample_rate: int = 30,
     thresholds: Optional[dict] = None,
-    trip_gap_minutes: int = 5,
 ) -> IndexResult:
     """Index a single video file on demand (e.g., after archiving).
 
@@ -1784,7 +1390,6 @@ def index_single_file(
 
         result = _index_video(
             conn, video_path, teslacam_root, sample_rate, thresholds,
-            trip_gap_minutes,
         )
 
         # Record in indexed_files for any terminal outcome that produced a
@@ -1796,7 +1401,7 @@ def index_single_file(
             IndexOutcome.INDEXED,
             IndexOutcome.DUPLICATE_UPGRADED,
         ) or (
-            result.outcome == IndexOutcome.NO_GPS_RECORDED
+            result.outcome == IndexOutcome.NO_MOVEMENT_RECORDED
             and (time.time() - stat.st_mtime) > 300
         ):
             conn.execute(
@@ -1863,16 +1468,13 @@ def purge_deleted_videos(db_path: str, teslacam_path: Optional[str] = None,
       exists.
 
     Returns a dict with keys ``purged_files``, ``purged_waypoints``,
-    ``purged_events``, ``purged_trips``. The ``waypoints``/``events``
-    counts now reflect rows whose ``video_path`` was nulled (not
-    deleted); ``purged_trips`` is always 0 and remains in the dict for
-    backward compatibility.
+    ``purged_events``. The ``waypoints``/``events`` counts now reflect
+    rows whose ``video_path`` was nulled (not deleted).
     """
     conn = _init_db(db_path)
     purged_files = 0
     purged_waypoints = 0
     purged_events = 0
-    purged_trips = 0
 
     try:
         if deleted_paths:
@@ -2111,7 +1713,6 @@ def purge_deleted_videos(db_path: str, teslacam_path: Optional[str] = None,
         'purged_files': purged_files,
         'purged_waypoints': purged_waypoints,
         'purged_events': purged_events,
-        'purged_trips': purged_trips,
     }
 
 
@@ -2712,27 +2313,27 @@ def diagnose_video(teslacam_path: str, max_videos: int = 3) -> dict:
 
             # Try full SEI extraction with sample_rate=1 for max detail
             sei_msgs = []
-            gps_msgs = []
+            movement_msgs = []
             parse_error = None
             try:
                 for msg in parser.extract_sei_messages(vp, sample_rate=1):
                     sei_msgs.append(msg)
-                    if msg.has_gps:
-                        gps_msgs.append(msg)
+                    if msg.has_movement:
+                        movement_msgs.append(msg)
                     if len(sei_msgs) >= 10:
                         break  # Enough for diagnosis
             except Exception as e:
                 parse_error = str(e)
 
             diag['sei_messages_sampled'] = len(sei_msgs)
-            diag['gps_messages'] = len(gps_msgs)
+            diag['movement_messages'] = len(movement_msgs)
             if parse_error:
                 diag['parse_error'] = parse_error
 
-            # Show first GPS point if found
-            if gps_msgs:
-                first = gps_msgs[0]
-                diag['sample_gps'] = {
+            # Show first movement point if found
+            if movement_msgs:
+                first = movement_msgs[0]
+                diag['sample_movement'] = {
                     'lat': first.latitude_deg,
                     'lon': first.longitude_deg,
                     'speed_mph': round(first.speed_mph, 1),
@@ -2742,7 +2343,7 @@ def diagnose_video(teslacam_path: str, max_videos: int = 3) -> dict:
             elif sei_msgs:
                 # Show first SEI to see what data exists
                 first = sei_msgs[0]
-                diag['sample_sei_no_gps'] = {
+                diag['sample_sei_stationary'] = {
                     'lat': first.latitude_deg,
                     'lon': first.longitude_deg,
                     'speed_mph': round(first.speed_mph, 1),

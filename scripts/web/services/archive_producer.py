@@ -315,7 +315,8 @@ def get_peek_cache_stats() -> Dict[str, int]:
 def _peek_clip_for_gps(source_path: str) -> Optional[bool]:
     """Producer-side wrapper around the worker's SEI peek.
 
-    Mirrors :func:`archive_worker._clip_has_gps_signal` so the producer
+    Mirrors :func:`archive_worker._clip_has_gps_signal` (which now uses
+    :attr:`~sei_parser.SeiMessage.has_movement`) so the producer
     doesn't have to import the worker module at load time (one-way
     dependency: the worker may import producer-side helpers, never
     the reverse). Returns the same tri-state: True (has GPS), False
@@ -358,7 +359,7 @@ def _peek_clip_for_gps(source_path: str) -> Optional[bool]:
                 sample_rate=_SAMPLE_RATE,
                 max_walk_bytes=_MAX_WALK_BYTES):
             scanned += 1
-            if msg.has_gps:
+            if msg.has_movement:
                 return True
             if scanned >= _MAX_MESSAGES:
                 break

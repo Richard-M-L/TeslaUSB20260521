@@ -36,10 +36,6 @@ from services.mapping_migrations import (
     _init_db,
     _waypoints_has_cold_columns,
 )
-from services.mapping_queries import (
-    query_trip_route,
-    query_trip_telemetry,
-)
 from services.mapping_service import (
     DEFAULT_THRESHOLDS,
     _index_video,
@@ -67,7 +63,7 @@ from tests.test_mapping_service import (
 _V14_WAYPOINTS_DDL = """
 CREATE TABLE waypoints (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    trip_id INTEGER,
+
     timestamp TEXT NOT NULL,
     lat REAL NOT NULL,
     lon REAL NOT NULL,
@@ -87,21 +83,6 @@ CREATE TABLE waypoints (
 )
 """
 
-_V14_TRIPS_DDL = """
-CREATE TABLE trips (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    start_time TEXT NOT NULL,
-    end_time TEXT,
-    start_lat REAL,
-    start_lon REAL,
-    end_lat REAL,
-    end_lon REAL,
-    distance_km REAL DEFAULT 0,
-    duration_seconds INTEGER DEFAULT 0,
-    source_folder TEXT
-)
-"""
-
 _V14_SCHEMA_VERSION_DDL = """
 CREATE TABLE schema_version (
     version INTEGER PRIMARY KEY,
@@ -116,7 +97,6 @@ def _build_v14_db(db_path: str) -> None:
     migration to do its thing."""
     conn = sqlite3.connect(db_path)
     try:
-        conn.execute(_V14_TRIPS_DDL)
         conn.execute(_V14_WAYPOINTS_DDL)
         conn.execute(_V14_SCHEMA_VERSION_DDL)
         conn.execute("INSERT INTO schema_version (version) VALUES (14)")
@@ -125,7 +105,7 @@ def _build_v14_db(db_path: str) -> None:
         conn.close()
 
 
-def _seed_waypoints(db_path: str, *, trip_id: int = 1, count: int = 3,
+def _seed_waypoints(db_path: str, *, count: int = 3,
                     cold_data: bool = True) -> None:
     """Insert ``count`` waypoints. When ``cold_data`` is True, every
     row carries non-default cold telemetry; when False, every row uses
@@ -133,25 +113,18 @@ def _seed_waypoints(db_path: str, *, trip_id: int = 1, count: int = 3,
     shouldn't backfill anything)."""
     conn = sqlite3.connect(db_path)
     try:
-        conn.execute(
-            "INSERT INTO trips (id, start_time, end_time, distance_km, "
-            "                   duration_seconds, source_folder) "
-            "VALUES (?, '2026-05-04T08:00:00', '2026-05-04T08:10:00', "
-            "        2.5, 600, 'RecentClips')",
-            (trip_id,),
-        )
         for i in range(count):
             if cold_data:
                 conn.execute(
                     """INSERT INTO waypoints
-                        (trip_id, timestamp, lat, lon, heading, speed_mps,
+                        (timestamp, lat, lon, heading, speed_mps,
                          autopilot_state, video_path, frame_offset,
                          acceleration_x, acceleration_y, acceleration_z,
                          gear, steering_angle, brake_applied,
                          blinker_on_left, blinker_on_right)
-                       VALUES (?, ?, ?, ?, 90.0, 25.0, 'NONE',
+                       VALUES (?, ?, ?, 90.0, 25.0, 'NONE',
                                'clip.mp4', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (trip_id, f'2026-05-04T08:0{i}:00',
+                    (f'2026-05-04T08:0{i}:00',
                      37.7749 + i * 0.001, -122.4194 + i * 0.001, i * 30,
                      -1.5 + i, 0.5, 0.1,
                      'D', 12.0 + i, 1 if i % 2 else 0, i % 2, (i + 1) % 2),
@@ -159,11 +132,11 @@ def _seed_waypoints(db_path: str, *, trip_id: int = 1, count: int = 3,
             else:
                 conn.execute(
                     """INSERT INTO waypoints
-                        (trip_id, timestamp, lat, lon, heading, speed_mps,
+                        (timestamp, lat, lon, heading, speed_mps,
                          autopilot_state, video_path, frame_offset)
-                       VALUES (?, ?, ?, ?, 90.0, 25.0, 'NONE',
+                       VALUES (?, ?, ?, 90.0, 25.0, 'NONE',
                                'clip.mp4', ?)""",
-                    (trip_id, f'2026-05-04T08:0{i}:00',
+                    (f'2026-05-04T08:0{i}:00',
                      37.7749 + i * 0.001, -122.4194 + i * 0.001, i * 30),
                 )
         conn.commit()
@@ -182,7 +155,7 @@ class TestV14ToV15Migration:
     def test_migration_backfills_cold_table_and_drops_columns(self, tmp_path):
         db_path = str(tmp_path / "geodata.db")
         _build_v14_db(db_path)
-        _seed_waypoints(db_path, trip_id=1, count=3, cold_data=True)
+        _seed_waypoints(db_path, count=3, cold_data=True)
 
         # Trigger the upgrade walk.
         conn = _init_db(db_path)
@@ -224,7 +197,7 @@ class TestV14ToV15Migration:
         # waypoint and defeat the point of the split.
         db_path = str(tmp_path / "geodata.db")
         _build_v14_db(db_path)
-        _seed_waypoints(db_path, trip_id=1, count=3, cold_data=False)
+        _seed_waypoints(db_path, count=3, cold_data=False)
 
         conn = _init_db(db_path)
         try:
@@ -247,7 +220,7 @@ class TestV14ToV15Migration:
         # cold columns are gone.
         db_path = str(tmp_path / "geodata.db")
         _build_v14_db(db_path)
-        _seed_waypoints(db_path, trip_id=1, count=2, cold_data=True)
+        _seed_waypoints(db_path, count=2, cold_data=True)
 
         # First run does the work.
         _init_db(db_path).close()
@@ -404,7 +377,7 @@ class TestV14ToV15Migration:
         import logging
         db_path = str(tmp_path / "geodata.db")
         _build_v14_db(db_path)
-        _seed_waypoints(db_path, trip_id=1, count=3, cold_data=True)
+        _seed_waypoints(db_path, count=3, cold_data=True)
 
         with caplog.at_level(logging.INFO,
                              logger='services.mapping_migrations'):
@@ -433,7 +406,7 @@ class TestV14ToV15Migration:
         """
         db_path = str(tmp_path / "geodata.db")
         _build_v14_db(db_path)
-        _seed_waypoints(db_path, trip_id=1, count=3, cold_data=True)
+        _seed_waypoints(db_path, count=3, cold_data=True)
 
         conn = _init_db(db_path)
         try:
@@ -474,7 +447,7 @@ class TestV14ToV15Migration:
         _build_v14_db(db_path)
         # Seed 5 waypoints so we get coverage of multiple ids /
         # offsets.
-        _seed_waypoints(db_path, trip_id=1, count=5, cold_data=True)
+        _seed_waypoints(db_path, count=5, cold_data=True)
 
         # Snapshot hot-column values BEFORE the migration.
         c = sqlite3.connect(db_path)
@@ -520,7 +493,7 @@ class TestV14ToV15Migration:
         """
         db_path = str(tmp_path / "geodata.db")
         _build_v14_db(db_path)
-        _seed_waypoints(db_path, trip_id=1, count=3, cold_data=True)
+        _seed_waypoints(db_path, count=3, cold_data=True)
 
         conn = _init_db(db_path)
         try:
@@ -553,7 +526,7 @@ class TestV14ToV15Migration:
         """
         db_path = str(tmp_path / "geodata.db")
         _build_v14_db(db_path)
-        _seed_waypoints(db_path, trip_id=1, count=2, cold_data=True)
+        _seed_waypoints(db_path, count=2, cold_data=True)
 
         conn = _init_db(db_path)
         try:
@@ -589,7 +562,7 @@ class TestV14ToV15Migration:
         """
         db_path = str(tmp_path / "geodata.db")
         _build_v14_db(db_path)
-        _seed_waypoints(db_path, trip_id=1, count=5, cold_data=True)
+        _seed_waypoints(db_path, count=5, cold_data=True)
 
         # Delete the last waypoint pre-migration so the id is gone.
         c = sqlite3.connect(db_path)
@@ -633,7 +606,7 @@ class TestV14ToV15Migration:
 
         db_path = str(tmp_path / "geodata.db")
         _build_v14_db(db_path)
-        _seed_waypoints(db_path, trip_id=1, count=2, cold_data=True)
+        _seed_waypoints(db_path, count=2, cold_data=True)
 
         def boom(_conn):
             raise sqlite3.OperationalError(
@@ -678,7 +651,7 @@ class TestV14ToV15Migration:
         """
         db_path = str(tmp_path / "geodata.db")
         _build_v14_db(db_path)
-        _seed_waypoints(db_path, trip_id=1, count=5, cold_data=True)
+        _seed_waypoints(db_path, count=5, cold_data=True)
 
         # Delete the highest-id row pre-migration so MAX(id) <
         # sqlite_sequence.seq — exercises the restoration path.
@@ -729,7 +702,7 @@ class TestV14ToV15Migration:
         """
         db_path = str(tmp_path / "geodata.db")
         _build_v14_db(db_path)
-        _seed_waypoints(db_path, trip_id=1, count=4, cold_data=True)
+        _seed_waypoints(db_path, count=4, cold_data=True)
 
         # Pre-create the v15 waypoints_cold table and pre-populate
         # it as the OLD code's BACKFILL would have. Use the same
@@ -813,7 +786,7 @@ class TestV14ToV15Migration:
         import logging
         db_path = str(tmp_path / "geodata.db")
         _build_v14_db(db_path)
-        _seed_waypoints(db_path, trip_id=1, count=3, cold_data=True)
+        _seed_waypoints(db_path, count=3, cold_data=True)
 
         # Pre-create the zombie table to simulate a crash between
         # CREATE waypoints_new and DROP waypoints.
@@ -925,69 +898,6 @@ def test_v15_hot_columns_match_schema_sql():
 # ---------------------------------------------------------------------------
 
 class TestQueryTripRouteShape:
-    def test_route_excludes_cold_columns(self, tmp_path):
-        db_path = str(tmp_path / "geodata.db")
-        _build_v14_db(db_path)
-        _seed_waypoints(db_path, trip_id=1, count=3, cold_data=True)
-        _init_db(db_path).close()  # apply v15 migration
-
-        route = query_trip_route(db_path, trip_id=1)
-        assert len(route) == 3
-        wp = route[0]
-        # ``id`` is required so the JS can merge cold telemetry.
-        assert 'id' in wp
-        # Hot columns are present.
-        for col in ('lat', 'lon', 'speed_mps', 'heading',
-                    'autopilot_state', 'video_path', 'frame_offset',
-                    'timestamp'):
-            assert col in wp
-        # Cold columns must NOT be in the dict.
-        for col in _COLD_COLUMNS:
-            assert col not in wp, (
-                f"query_trip_route surfaced cold column {col!r}; "
-                "this would defeat the Wave 3 read-path savings"
-            )
-
-
-# ---------------------------------------------------------------------------
-# query_trip_telemetry — the new lazy-load helper backing
-# /api/trip/<id>/telemetry.
-# ---------------------------------------------------------------------------
-
-class TestQueryTripTelemetry:
-    def test_returns_dict_keyed_by_waypoint_id(self, tmp_path):
-        db_path = str(tmp_path / "geodata.db")
-        _build_v14_db(db_path)
-        _seed_waypoints(db_path, trip_id=1, count=3, cold_data=True)
-        _init_db(db_path).close()
-
-        telem = query_trip_telemetry(db_path, trip_id=1)
-        assert isinstance(telem, dict)
-        assert len(telem) == 3
-
-        # Keys are waypoint ids (ints — though JSON serializes them as
-        # strings on the wire, the in-process dict stays int-keyed).
-        for wp_id, payload in telem.items():
-            assert isinstance(wp_id, int)
-            for col in _COLD_COLUMNS:
-                assert col in payload, (
-                    f"telemetry payload missing cold column {col!r}"
-                )
-
-    def test_returns_empty_for_default_only_trip(self, tmp_path):
-        db_path = str(tmp_path / "geodata.db")
-        _build_v14_db(db_path)
-        _seed_waypoints(db_path, trip_id=1, count=3, cold_data=False)
-        _init_db(db_path).close()
-
-        telem = query_trip_telemetry(db_path, trip_id=1)
-        assert telem == {}
-
-    def test_returns_empty_for_unknown_trip(self, tmp_path):
-        db_path = str(tmp_path / "geodata.db")
-        _init_db(db_path).close()
-        assert query_trip_telemetry(db_path, trip_id=999) == {}
-
 
 # ---------------------------------------------------------------------------
 # _index_video runtime path — must NOT bloat waypoints_cold with a
@@ -1025,7 +935,7 @@ class TestIndexVideoColdSplit:
             wc, _ = _unpack(_index_video(
                 conn, str(clip), root,
                 sample_rate=1, thresholds=DEFAULT_THRESHOLDS,
-                trip_gap_minutes=5,
+
             ))
             assert wc == 3
 
@@ -1062,7 +972,7 @@ class TestIndexVideoColdSplit:
             wc, _ = _unpack(_index_video(
                 conn, str(clip), root,
                 sample_rate=1, thresholds=DEFAULT_THRESHOLDS,
-                trip_gap_minutes=5,
+
             ))
             assert wc == 3
 
@@ -1105,7 +1015,7 @@ class TestIndexVideoColdSplit:
             wc, _ = _unpack(_index_video(
                 conn, str(clip), root,
                 sample_rate=1, thresholds=DEFAULT_THRESHOLDS,
-                trip_gap_minutes=5,
+
             ))
             assert wc == 3
 
@@ -1139,7 +1049,7 @@ class TestIndexVideoColdSplit:
             _index_video(
                 conn, str(clip), root,
                 sample_rate=1, thresholds=DEFAULT_THRESHOLDS,
-                trip_gap_minutes=5,
+
             )
             cold = conn.execute(
                 "SELECT COUNT(*) AS n FROM waypoints_cold"
@@ -1169,7 +1079,7 @@ class TestIndexVideoColdSplit:
             _index_video(
                 conn, str(clip), root,
                 sample_rate=1, thresholds=DEFAULT_THRESHOLDS,
-                trip_gap_minutes=5,
+
             )
             cold = conn.execute(
                 "SELECT COUNT(*) AS n FROM waypoints_cold"
@@ -1196,7 +1106,7 @@ def telemetry_app(tmp_path, monkeypatch):
 
     db_path = str(tmp_path / "geodata.db")
     _build_v14_db(db_path)
-    _seed_waypoints(db_path, trip_id=1, count=3, cold_data=True)
+    _seed_waypoints(db_path, count=3, cold_data=True)
     _init_db(db_path).close()
 
     img_path = tmp_path / "usb_cam.img"
@@ -1219,31 +1129,6 @@ def telemetry_client(telemetry_app):
 
 
 class TestApiTripTelemetry:
-    def test_returns_telemetry_for_trip(self, telemetry_client):
-        r = telemetry_client.get('/api/trip/1/telemetry')
-        assert r.status_code == 200
-        body = r.get_json()
-        assert body['trip_id'] == 1
-        # JSON serialization stringifies dict int-keys.
-        assert isinstance(body['telemetry'], dict)
-        assert len(body['telemetry']) == 3
-        # Every payload has the cold columns.
-        sample = next(iter(body['telemetry'].values()))
-        for col in _COLD_COLUMNS:
-            assert col in sample
-
-    def test_returns_empty_for_unknown_trip(self, telemetry_client):
-        r = telemetry_client.get('/api/trip/999/telemetry')
-        assert r.status_code == 200
-        body = r.get_json()
-        assert body['trip_id'] == 999
-        assert body['telemetry'] == {}
-
-    def test_route_gated_on_image_file(self, telemetry_client,
-                                       telemetry_app, monkeypatch):
-        # Removing the cam image must block the route — same gate as
-        # the rest of the mapping blueprint. We send the request as
-        # AJAX so the gate returns 503 JSON instead of attempting a
         # redirect to ``mode_control.index`` (which isn't registered
         # in the hermetic test app).
         from blueprints import mapping as mapping_module

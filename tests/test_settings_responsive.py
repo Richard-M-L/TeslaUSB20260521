@@ -252,25 +252,21 @@ class TestIndexHtmlAdoption:
             "Archive Settings inputs not using settings-form-input"
         )
 
-    def test_mapping_settings_card_uses_classes(self):
+    def test_indexing_settings_card_uses_classes(self):
         html = _read(INDEX_HTML)
-        assert 'name="trip_gap_minutes"' in html, "test fixture broken"
-        # Find the trip_gap_minutes input and verify it has the class.
-        # The form-group wrapper is between the grid div and the input,
-        # so we just assert proximity: the class appears within ~500
-        # chars before the input.
-        idx = html.index('name="trip_gap_minutes"')
+        assert 'name="speed_limit_mph"' in html, "test fixture broken"
+        # Find the speed_limit_mph input and verify it has the class.
+        idx = html.index('name="speed_limit_mph"')
         window = html[max(0, idx - 800):idx]
         assert 'class="settings-form-grid"' in window, (
-            "trip_gap_minutes not nested under a "
+            "speed_limit_mph not nested under a "
             "<div class='settings-form-grid'> within 800 chars upstream"
         )
         # And the input itself uses settings-form-input.
-        # Find the start of this <input ...> and check forward 300 chars.
         input_start = html.rfind('<input', 0, idx)
         input_block = html[input_start:idx + 200]
         assert 'class="settings-form-input"' in input_block, (
-            "trip_gap_minutes input missing class='settings-form-input'"
+            "speed_limit_mph input missing class='settings-form-input'"
         )
 
     def test_samba_password_input_uses_class(self):

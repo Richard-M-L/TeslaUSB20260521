@@ -684,12 +684,10 @@ def _get_archive_config() -> dict:
 def _get_mapping_config() -> dict:
     """Read current mapping settings for the settings page."""
     from config import (
-        MAPPING_ENABLED,
-        MAPPING_TRIP_GAP_MINUTES, MAPPING_EVENT_THRESHOLDS,
+        MAPPING_ENABLED, MAPPING_EVENT_THRESHOLDS,
     )
     return {
         'enabled': MAPPING_ENABLED,
-        'trip_gap_minutes': MAPPING_TRIP_GAP_MINUTES,
         'speed_limit_mph': round(MAPPING_EVENT_THRESHOLDS.get('speed_limit_mps', 35.76) * 2.237, 0),
     }
 
@@ -738,7 +736,6 @@ def save_mapping_settings():
 
         updates = {
             'mapping.enabled': 'enabled' in request.form,
-            'mapping.trip_gap_minutes': max(1, int(request.form.get('trip_gap_minutes', 5))),
             'mapping.event_detection.speed_limit_mps': speed_mps,
         }
         update_config_yaml(updates)

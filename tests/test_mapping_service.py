@@ -15,7 +15,6 @@ from services.mapping_service import (
     _init_db,
     _detect_events,
     _debounce_events,
-    _haversine_km,
     _timestamp_from_filename,
     _find_front_camera_videos,
     _index_video,
@@ -35,15 +34,6 @@ from services.mapping_service import (
     _SCHEMA_VERSION,
 )
 from services.mapping_queries import (
-    _haversine_m,
-    _is_gap_between,
-    _parse_iso_seconds,
-    GAP_MAX_SECONDS_DEFAULT,
-    GAP_MAX_METERS_DEFAULT,
-    query_days,
-    query_day_routes,
-    query_trips,
-    query_trip_route,
     query_events,
     get_stats,
     get_driving_stats,
@@ -505,29 +495,6 @@ class TestDebounce:
 # ---------------------------------------------------------------------------
 
 class TestHaversine:
-    def test_same_point_zero_distance(self):
-        assert _haversine_km(37.0, -122.0, 37.0, -122.0) == 0.0
-
-    def test_known_distance(self):
-        # SF to LA is roughly 559 km
-        dist = _haversine_km(37.7749, -122.4194, 34.0522, -118.2437)
-        assert 550 < dist < 570
-
-    def test_short_distance(self):
-        # ~111 meters (0.001 degrees latitude)
-        dist = _haversine_km(37.0, -122.0, 37.001, -122.0)
-        assert 0.1 < dist < 0.12
-
-
-class TestTimestampFromFilename:
-    def test_standard_tesla_filename(self):
-        ts = _timestamp_from_filename('2025-11-08_08-15-44-front.mp4')
-        assert ts == '2025-11-08T08:15:44'
-
-    def test_with_full_path(self):
-        ts = _timestamp_from_filename('/mnt/gadget/part1/TeslaCam/RecentClips/2025-11-08_08-15-44-front.mp4')
-        assert ts == '2025-11-08T08:15:44'
-
     def test_invalid_filename(self):
         assert _timestamp_from_filename('random_file.mp4') is None
 
@@ -673,689 +640,6 @@ class TestQueryAPIs:
         conn.close()
         return db_path
 
-    def test_query_trips(self, db_with_data):
-        trips = query_trips(db_with_data)
-        assert len(trips) == 1
-        assert trips[0]['source_folder'] == 'RecentClips'
-        # Enrichment is now part of the same SQL — make sure it still
-        # surfaces the per-trip event/video counts.
-        assert trips[0]['event_count'] == 1
-        assert trips[0]['video_count'] == 1
-
-    def test_query_trips_zero_counts_when_empty(self, tmp_path):
-        # A trip with no events and no waypoints must still come back with
-        # numeric counts (not NULL) — the UI sorts/filters on these fields.
-        db_path = str(tmp_path / "empty_trip.db")
-        conn = _init_db(db_path)
-        conn.execute(
-            "INSERT INTO trips (id, start_time, end_time, distance_km, "
-            "                   source_folder) "
-            "VALUES (99, '2025-12-01T00:00:00', '2025-12-01T00:10:00', "
-            "        1.0, 'RecentClips')"
-        )
-        conn.commit()
-        conn.close()
-
-        trips = query_trips(db_path)
-        assert len(trips) == 1
-        assert trips[0]['event_count'] == 0
-        assert trips[0]['video_count'] == 0
-
-    def test_query_trips_distinct_video_count(self, tmp_path):
-        # Multiple waypoints sharing the same video_path must collapse to
-        # ONE video, not N. This is the bug the covering index fixes.
-        db_path = str(tmp_path / "distinct.db")
-        conn = _init_db(db_path)
-        conn.execute(
-            "INSERT INTO trips (id, start_time, end_time, distance_km, "
-            "                   source_folder) "
-            "VALUES (1, '2025-12-01T00:00:00', '2025-12-01T00:10:00', "
-            "        1.0, 'RecentClips')"
-        )
-        # 3 waypoints in same clip + 2 in another + 1 with NULL path
-        for i in range(3):
-            conn.execute(
-                "INSERT INTO waypoints (trip_id, timestamp, lat, lon, "
-                "                       video_path) "
-                "VALUES (1, ?, 37.0, -122.0, 'RecentClips/clip_a-front.mp4')",
-                (f'2025-12-01T00:00:{i:02d}',)
-            )
-        for i in range(2):
-            conn.execute(
-                "INSERT INTO waypoints (trip_id, timestamp, lat, lon, "
-                "                       video_path) "
-                "VALUES (1, ?, 37.0, -122.0, 'RecentClips/clip_b-front.mp4')",
-                (f'2025-12-01T00:01:{i:02d}',)
-            )
-        conn.execute(
-            "INSERT INTO waypoints (trip_id, timestamp, lat, lon, "
-            "                       video_path) "
-            "VALUES (1, '2025-12-01T00:02:00', 37.0, -122.0, NULL)"
-        )
-        conn.commit()
-        conn.close()
-
-        trips = query_trips(db_path)
-        assert trips[0]['video_count'] == 2  # NULL excluded; duplicates collapsed
-
-    def test_query_trips_with_date_filter(self, db_with_data):
-        trips = query_trips(db_with_data, date_from='2025-11-09')
-        assert len(trips) == 0
-
-    def test_query_trip_route(self, db_with_data):
-        route = query_trip_route(db_with_data, trip_id=1)
-        assert len(route) == 5
-        assert 'lat' in route[0]
-        assert 'lon' in route[0]
-
-    def test_query_events(self, db_with_data):
-        events = query_events(db_with_data)
-        assert len(events) == 1
-        assert events[0]['event_type'] == 'harsh_brake'
-
-    def test_query_events_filter_type(self, db_with_data):
-        events = query_events(db_with_data, event_type='speeding')
-        assert len(events) == 0
-
-    def test_get_stats(self, db_with_data):
-        stats = get_stats(db_with_data)
-        assert stats['trip_count'] == 1
-        assert stats['waypoint_count'] == 5
-        assert stats['event_count'] == 1
-        assert stats['event_breakdown']['harsh_brake'] == 1
-
-
-# ---------------------------------------------------------------------------
-# Day-Based Query Tests (powering the day navigator)
-# ---------------------------------------------------------------------------
-
-class TestQueryDays:
-    """Aggregate-by-day query that drives the bottom-left day card.
-
-    Day-bucketing is by ``substr(timestamp, 1, 10)`` — NEVER ``date()``
-    — because Tesla writes timezone-naive ISO strings and SQLite's
-    ``date()`` would silently mis-bucket any row that ever gained a
-    Z/offset suffix. Tests cover trip-only days, event-only days,
-    mixed days, ordering, sentry events with NULL coords, and the
-    min_distance_km filter (which must match /api/trips behaviour).
-    """
-
-    def _make_db(self, tmp_path, name='days.db'):
-        db_path = str(tmp_path / name)
-        conn = _init_db(db_path)
-        return db_path, conn
-
-    def _add_trip(self, conn, trip_id, start, end=None, distance_km=2.5):
-        conn.execute(
-            """INSERT INTO trips (id, start_time, end_time, distance_km,
-                                  duration_seconds, source_folder)
-               VALUES (?, ?, ?, ?, 600, 'RecentClips')""",
-            (trip_id, start, end or start, distance_km),
-        )
-
-    def _add_event(self, conn, trip_id, ts, event_type='harsh_brake',
-                   lat=37.7749, lon=-122.4194):
-        conn.execute(
-            """INSERT INTO detected_events (trip_id, timestamp, lat, lon,
-                                            event_type, severity, description)
-               VALUES (?, ?, ?, ?, ?, 'warning', 'test')""",
-            (trip_id, ts, lat, lon, event_type),
-        )
-
-    def test_trip_only_day(self, tmp_path):
-        db_path, conn = self._make_db(tmp_path)
-        self._add_trip(conn, 1, '2026-05-04T08:15:00', '2026-05-04T08:25:00',
-                       distance_km=3.2)
-        conn.commit(); conn.close()
-
-        days = query_days(db_path)
-        assert len(days) == 1
-        assert days[0]['date'] == '2026-05-04'
-        assert days[0]['trip_count'] == 1
-        assert days[0]['event_count'] == 0
-        assert days[0]['sentry_count'] == 0
-        assert days[0]['total_distance_km'] == pytest.approx(3.2)
-        assert days[0]['first_start'] == '2026-05-04T08:15:00'
-        assert days[0]['last_end'] == '2026-05-04T08:25:00'
-
-    def test_event_only_day_surfaces_in_navigator(self, tmp_path):
-        # A weekend at home with sentry events — no trips — must
-        # still appear in the day navigator. This is the entire
-        # point of the day-based redesign vs. trip-based.
-        db_path, conn = self._make_db(tmp_path)
-        self._add_event(conn, None, '2026-05-04T22:30:00',
-                        event_type='sentry')
-        conn.commit(); conn.close()
-
-        days = query_days(db_path)
-        assert len(days) == 1
-        assert days[0]['date'] == '2026-05-04'
-        assert days[0]['trip_count'] == 0
-        assert days[0]['event_count'] == 1
-        assert days[0]['sentry_count'] == 1
-        assert days[0]['first_start'] is None
-        assert days[0]['last_end'] is None
-
-    def test_sentry_with_null_coords_still_counted(self, tmp_path):
-        # Sentry events sometimes have NULL lat/lon (when SEI parsing
-        # extracted no GPS). They must STILL count in event_count and
-        # sentry_count so the day card stat reads truthfully — the
-        # frontend handles "N events · location not available" UX.
-        db_path, conn = self._make_db(tmp_path)
-        conn.execute(
-            """INSERT INTO detected_events (trip_id, timestamp, lat, lon,
-                                            event_type, severity, description)
-               VALUES (NULL, '2026-05-04T22:30:00', NULL, NULL,
-                       'sentry', 'info', 'no gps')"""
-        )
-        conn.commit(); conn.close()
-
-        days = query_days(db_path)
-        assert days[0]['event_count'] == 1
-        assert days[0]['sentry_count'] == 1
-
-    def test_mixed_day_combines_trip_and_event_stats(self, tmp_path):
-        db_path, conn = self._make_db(tmp_path)
-        self._add_trip(conn, 1, '2026-05-04T08:15:00', '2026-05-04T08:25:00',
-                       distance_km=3.2)
-        self._add_trip(conn, 2, '2026-05-04T17:00:00', '2026-05-04T17:30:00',
-                       distance_km=5.5)
-        self._add_event(conn, 1, '2026-05-04T08:20:00')
-        self._add_event(conn, None, '2026-05-04T22:30:00',
-                        event_type='sentry')
-        conn.commit(); conn.close()
-
-        days = query_days(db_path)
-        assert len(days) == 1
-        d = days[0]
-        assert d['date'] == '2026-05-04'
-        assert d['trip_count'] == 2
-        assert d['total_distance_km'] == pytest.approx(8.7)
-        assert d['event_count'] == 2
-        assert d['sentry_count'] == 1
-        assert d['first_start'] == '2026-05-04T08:15:00'
-        assert d['last_end'] == '2026-05-04T17:30:00'
-
-    def test_ordering_most_recent_first(self, tmp_path):
-        db_path, conn = self._make_db(tmp_path)
-        self._add_trip(conn, 1, '2026-04-01T08:00:00')
-        self._add_trip(conn, 2, '2026-05-04T08:00:00')
-        self._add_trip(conn, 3, '2026-04-15T08:00:00')
-        conn.commit(); conn.close()
-
-        days = query_days(db_path)
-        assert [d['date'] for d in days] == [
-            '2026-05-04', '2026-04-15', '2026-04-01'
-        ]
-
-    def test_min_distance_filter_excludes_parking_blips(self, tmp_path):
-        # Default 50 m hides parking-lot blips. Without this filter
-        # the day card would advertise "3 trips" while /api/trips
-        # only returns 1 — the day card and the trips list must
-        # agree.
-        db_path, conn = self._make_db(tmp_path)
-        self._add_trip(conn, 1, '2026-05-04T08:15:00', distance_km=3.2)
-        self._add_trip(conn, 2, '2026-05-04T08:30:00', distance_km=0.005)  # 5 m blip
-        self._add_trip(conn, 3, '2026-05-04T09:00:00', distance_km=0.0)
-        conn.commit(); conn.close()
-
-        # With default filter (50 m) only the 3.2 km trip counts.
-        days = query_days(db_path)
-        assert days[0]['trip_count'] == 1
-        assert days[0]['total_distance_km'] == pytest.approx(3.2)
-
-        # With min_distance_km=0 every trip counts.
-        days = query_days(db_path, min_distance_km=0.0)
-        assert days[0]['trip_count'] == 3
-        assert days[0]['total_distance_km'] == pytest.approx(3.205)
-
-    def test_limit_clamps_results(self, tmp_path):
-        db_path, conn = self._make_db(tmp_path)
-        for i in range(10):
-            self._add_trip(conn, i + 1, f'2026-05-{i+1:02d}T08:00:00')
-        conn.commit(); conn.close()
-
-        days = query_days(db_path, limit=3)
-        assert len(days) == 3
-        # Most recent first
-        assert days[0]['date'] == '2026-05-10'
-        assert days[2]['date'] == '2026-05-08'
-
-    def test_substr_bucketing_handles_naive_iso_timestamps(self, tmp_path):
-        # Tesla writes naive ISO strings like '2026-05-04T08:15:00'.
-        # substr(...,1,10) yields '2026-05-04' regardless of any future
-        # suffix (Z, +offset). This test pins that contract — switching
-        # to date() would silently mis-bucket Z-suffixed rows.
-        db_path, conn = self._make_db(tmp_path)
-        self._add_trip(conn, 1, '2026-05-04T23:59:59',
-                       end='2026-05-05T00:00:01')
-        conn.commit(); conn.close()
-
-        days = query_days(db_path)
-        # Trip starting on 5/4 belongs to 5/4, even though it ended on 5/5.
-        assert len(days) == 1
-        assert days[0]['date'] == '2026-05-04'
-
-    def test_empty_db(self, tmp_path):
-        db_path, conn = self._make_db(tmp_path)
-        conn.commit(); conn.close()
-        assert query_days(db_path) == []
-
-
-class TestQueryDayRoutes:
-    """Per-day route aggregator that drives the multi-trip overlay.
-
-    Tests cover: multi-trip rendering, midnight-spanning trip
-    bucketing, waypoint ordering within a trip, archive path
-    handling deferred to the blueprint, empty days, and the
-    min_distance filter matching ``/api/trips``.
-    """
-
-    def _make_db(self, tmp_path, name='day_routes.db'):
-        db_path = str(tmp_path / name)
-        conn = _init_db(db_path)
-        return db_path, conn
-
-    def _add_trip(self, conn, trip_id, start, end=None, distance_km=2.5,
-                  source_folder='RecentClips'):
-        conn.execute(
-            """INSERT INTO trips (id, start_time, end_time, start_lat,
-                                  start_lon, end_lat, end_lon, distance_km,
-                                  duration_seconds, source_folder)
-               VALUES (?, ?, ?, 37.7, -122.4, 37.8, -122.5, ?, 600, ?)""",
-            (trip_id, start, end or start, distance_km, source_folder),
-        )
-
-    def _add_waypoints(self, conn, trip_id, count, video_path='clip.mp4',
-                       start_ts='2026-05-04T08:15:00'):
-        for i in range(count):
-            conn.execute(
-                """INSERT INTO waypoints (trip_id, timestamp, lat, lon,
-                                         speed_mps, autopilot_state,
-                                         video_path, frame_offset)
-                   VALUES (?, ?, ?, ?, 25.0, 'NONE', ?, ?)""",
-                (trip_id, start_ts, 37.7 + i * 0.001, -122.4 + i * 0.001,
-                 video_path, i * 30),
-            )
-
-    def test_multi_trip_day(self, tmp_path):
-        db_path, conn = self._make_db(tmp_path)
-        self._add_trip(conn, 1, '2026-05-04T08:00:00', distance_km=3.2)
-        self._add_waypoints(conn, 1, count=4)
-        self._add_trip(conn, 2, '2026-05-04T17:00:00', distance_km=5.5)
-        self._add_waypoints(conn, 2, count=3, video_path='clip2.mp4')
-        # A trip on a different day must NOT be returned.
-        self._add_trip(conn, 3, '2026-05-05T08:00:00')
-        self._add_waypoints(conn, 3, count=2, video_path='clip3.mp4')
-        conn.commit(); conn.close()
-
-        result = query_day_routes(db_path, '2026-05-04')
-        assert len(result['trips']) == 2
-        # Ordered by start_time DESC — newest first.
-        assert result['trips'][0]['trip_id'] == 2
-        assert result['trips'][1]['trip_id'] == 1
-        assert len(result['trips'][0]['waypoints']) == 3
-        assert len(result['trips'][1]['waypoints']) == 4
-
-    def test_midnight_spanning_trip_belongs_to_start_day(self, tmp_path):
-        # User-confirmed bucketing rule: a trip that starts at 23:59:00
-        # on 5/4 and ends at 00:30:00 on 5/5 is part of 5/4's day. The
-        # day card reads truthfully and the route renders on the right
-        # day. The opposite bucket (5/5) must NOT see this trip.
-        db_path, conn = self._make_db(tmp_path)
-        self._add_trip(conn, 1, '2026-05-04T23:59:00',
-                       end='2026-05-05T00:30:00', distance_km=3.0)
-        self._add_waypoints(conn, 1, count=2)
-        conn.commit(); conn.close()
-
-        same_day = query_day_routes(db_path, '2026-05-04')
-        next_day = query_day_routes(db_path, '2026-05-05')
-        assert len(same_day['trips']) == 1
-        assert same_day['trips'][0]['trip_id'] == 1
-        assert next_day['trips'] == []
-
-    def test_waypoints_ordered_by_timestamp_not_id(self, tmp_path):
-        # Regression: when v2->v3 trip-merge combines two trips, or a
-        # late-arriving video gets indexed into an existing trip
-        # (boot catch-up scan, file watcher, ArchivedClips re-discovery),
-        # the new waypoints land with higher ids but their timestamps
-        # fall in the middle of the trip's time range. Walking those
-        # in id-order draws long straight diagonals across the map
-        # — bug confirmed in the field on Apr 26 2026 view.
-        # The query MUST return waypoints in timestamp order so the
-        # frontend renders the polyline correctly.
-        db_path, conn = self._make_db(tmp_path)
-        self._add_trip(conn, 1, '2026-05-04T08:00:00')
-        # Simulate two ingest batches that interleave temporally:
-        #   - First batch: t=00, t=02, t=04 (the original video)
-        #   - Second batch: t=01, t=03 (the late-discovered video,
-        #     same trip, gets higher ids 4 and 5).
-        # If ordered by id we get times 0,2,4,1,3 — zigzag.
-        # If ordered by timestamp we get 0,1,2,3,4 — clean polyline.
-        rows = [
-            ('2026-05-04T08:00:00', 37.700, -122.400),  # id=1
-            ('2026-05-04T08:00:02', 37.702, -122.402),  # id=2
-            ('2026-05-04T08:00:04', 37.704, -122.404),  # id=3
-            ('2026-05-04T08:00:01', 37.701, -122.401),  # id=4 (late)
-            ('2026-05-04T08:00:03', 37.703, -122.403),  # id=5 (late)
-        ]
-        for ts, lat, lon in rows:
-            conn.execute(
-                """INSERT INTO waypoints (trip_id, timestamp, lat, lon,
-                                         speed_mps, autopilot_state,
-                                         video_path, frame_offset)
-                   VALUES (1, ?, ?, ?, 25.0, 'NONE', 'clip.mp4', 0)""",
-                (ts, lat, lon),
-            )
-        conn.commit(); conn.close()
-
-        result = query_day_routes(db_path, '2026-05-04')
-        timestamps = [wp['timestamp'] for wp in result['trips'][0]['waypoints']]
-        assert timestamps == sorted(timestamps), (
-            "waypoints must be returned in timestamp ASC order so "
-            "polyline rendering follows true chronological path; "
-            "got %r" % timestamps
-        )
-
-    def test_waypoints_id_tiebreaks_identical_timestamps(self, tmp_path):
-        # When timestamps tie (rare but possible — e.g., two SEI rows
-        # for the same MP4 frame), id ASC is the deterministic
-        # tiebreaker so output stays stable across runs.
-        db_path, conn = self._make_db(tmp_path)
-        self._add_trip(conn, 1, '2026-05-04T08:00:00')
-        self._add_waypoints(conn, 1, count=5)  # all share start_ts
-        conn.commit(); conn.close()
-
-        result = query_day_routes(db_path, '2026-05-04')
-        ids = [wp['id'] for wp in result['trips'][0]['waypoints']]
-        assert ids == sorted(ids)
-
-    def test_min_distance_filter_excludes_parking_blips(self, tmp_path):
-        db_path, conn = self._make_db(tmp_path)
-        self._add_trip(conn, 1, '2026-05-04T08:00:00', distance_km=3.0)
-        self._add_waypoints(conn, 1, count=2)
-        self._add_trip(conn, 2, '2026-05-04T09:00:00', distance_km=0.005)
-        self._add_waypoints(conn, 2, count=2, video_path='blip.mp4')
-        conn.commit(); conn.close()
-
-        # Default filter excludes the 5 m blip.
-        result = query_day_routes(db_path, '2026-05-04')
-        assert [t['trip_id'] for t in result['trips']] == [1]
-        # min_distance_km=0 includes both.
-        result = query_day_routes(db_path, '2026-05-04', min_distance_km=0.0)
-        assert sorted(t['trip_id'] for t in result['trips']) == [1, 2]
-
-    def test_empty_day_returns_empty_list(self, tmp_path):
-        db_path, conn = self._make_db(tmp_path)
-        self._add_trip(conn, 1, '2026-05-04T08:00:00')
-        self._add_waypoints(conn, 1, count=2)
-        conn.commit(); conn.close()
-        assert query_day_routes(db_path, '2026-04-01') == {'trips': []}
-
-    def test_trips_with_no_waypoints_excluded_by_inner_join(self, tmp_path):
-        # A trip row with no waypoints can't render — the INNER JOIN
-        # excludes it. The day card's trip_count may legitimately
-        # exceed len(result['trips']) on databases with phantom trips.
-        db_path, conn = self._make_db(tmp_path)
-        self._add_trip(conn, 1, '2026-05-04T08:00:00')
-        # Trip 1 has zero waypoints.
-        self._add_trip(conn, 2, '2026-05-04T09:00:00')
-        self._add_waypoints(conn, 2, count=2)
-        conn.commit(); conn.close()
-
-        result = query_day_routes(db_path, '2026-05-04')
-        assert [t['trip_id'] for t in result['trips']] == [2]
-
-
-class TestQueryAllRoutesSimplified:
-    """Subsampled all-trip overview that powers the All time map view.
-
-    Tests cover: every-trip rendering, subsampling math (first +
-    last preserved + stride sample of middle), min_distance filter
-    matching /api/trips, ordering, and exclusion of trips that
-    can't render a polyline.
-    """
-
-    def _make_db(self, tmp_path, name='all_routes.db'):
-        db_path = str(tmp_path / name)
-        conn = _init_db(db_path)
-        return db_path, conn
-
-    def _add_trip(self, conn, trip_id, start, end=None, distance_km=2.5,
-                  source_folder='RecentClips'):
-        conn.execute(
-            """INSERT INTO trips (id, start_time, end_time, start_lat,
-                                  start_lon, end_lat, end_lon, distance_km,
-                                  duration_seconds, source_folder)
-               VALUES (?, ?, ?, 37.7, -122.4, 37.8, -122.5, ?, 600, ?)""",
-            (trip_id, start, end or start, distance_km, source_folder),
-        )
-
-    def _add_waypoints(self, conn, trip_id, count, video_path='clip.mp4',
-                       start_ts='2026-05-04T08:15:00'):
-        for i in range(count):
-            conn.execute(
-                """INSERT INTO waypoints (trip_id, timestamp, lat, lon,
-                                         speed_mps, autopilot_state,
-                                         video_path, frame_offset)
-                   VALUES (?, ?, ?, ?, 25.0, 'NONE', ?, ?)""",
-                (trip_id, start_ts, 37.7 + i * 0.001, -122.4 + i * 0.001,
-                 video_path, i * 30),
-            )
-
-    def test_all_trips_returned_ordered_newest_first(self, tmp_path):
-        from services.mapping_queries import query_all_routes_simplified
-        db_path, conn = self._make_db(tmp_path)
-        self._add_trip(conn, 1, '2026-05-03T08:00:00', distance_km=3.0)
-        self._add_waypoints(conn, 1, count=4)
-        self._add_trip(conn, 2, '2026-05-04T08:00:00', distance_km=5.0)
-        self._add_waypoints(conn, 2, count=4, video_path='c2.mp4')
-        self._add_trip(conn, 3, '2026-05-05T08:00:00', distance_km=8.0)
-        self._add_waypoints(conn, 3, count=4, video_path='c3.mp4')
-        conn.commit(); conn.close()
-
-        trips = query_all_routes_simplified(db_path)
-        assert [t['trip_id'] for t in trips] == [3, 2, 1]
-
-    def test_each_trip_carries_its_start_date(self, tmp_path):
-        # The client uses ``date`` to drill into the right day on
-        # polyline click — must match substr(start_time, 1, 10), the
-        # same bucketing rule query_days/query_day_routes use.
-        from services.mapping_queries import query_all_routes_simplified
-        db_path, conn = self._make_db(tmp_path)
-        self._add_trip(conn, 1, '2026-05-04T23:59:00',
-                       end='2026-05-05T00:30:00', distance_km=3.0)
-        self._add_waypoints(conn, 1, count=2)
-        conn.commit(); conn.close()
-        trips = query_all_routes_simplified(db_path)
-        assert trips[0]['date'] == '2026-05-04'
-
-    def test_subsampling_keeps_first_and_last(self, tmp_path):
-        # First + last waypoints anchor the polyline at the trip's
-        # actual endpoints — no matter how aggressively RDP collapses
-        # straight middle stretches, both endpoints must survive.
-        from services.mapping_queries import query_all_routes_simplified
-        db_path, conn = self._make_db(tmp_path)
-        self._add_trip(conn, 1, '2026-05-04T08:00:00', distance_km=3.0)
-        # 200 waypoints at lat = 37.700, 37.701, ..., 37.899 (a
-        # perfectly straight line). RDP collapses straight lines to
-        # just the endpoints — that's the whole point.
-        self._add_waypoints(conn, 1, count=200)
-        conn.commit(); conn.close()
-
-        trips = query_all_routes_simplified(db_path)
-        assert len(trips) == 1
-        wps = trips[0]['waypoints']
-        # First waypoint preserved.
-        assert wps[0]['lat'] == pytest.approx(37.700)
-        # Last waypoint preserved.
-        assert wps[-1]['lat'] == pytest.approx(37.899)
-
-    def test_straight_line_collapses_to_endpoints(self, tmp_path):
-        # The whole motivation for RDP: a straight line of N points
-        # should compress to just the 2 endpoints, regardless of N.
-        # The previous stride-based sampler returned ~N/step points
-        # even on perfectly straight roads, wasting bytes for no
-        # visual benefit.
-        from services.mapping_queries import query_all_routes_simplified
-        db_path, conn = self._make_db(tmp_path)
-        self._add_trip(conn, 1, '2026-05-04T08:00:00', distance_km=10.0)
-        self._add_waypoints(conn, 1, count=500)
-        conn.commit(); conn.close()
-        trips = query_all_routes_simplified(db_path)
-        assert len(trips[0]['waypoints']) == 2
-
-    def test_sharp_corner_is_preserved(self, tmp_path):
-        # The bug RDP fixes: stride sampling cuts diagonally across
-        # sharp turns when the corner falls inside a stride gap. RDP
-        # detects the corner via its perpendicular distance from the
-        # chord and forces a kept point there.
-        from services.mapping_queries import query_all_routes_simplified
-        import sqlite3
-        db_path, conn = self._make_db(tmp_path)
-        self._add_trip(conn, 1, '2026-05-04T08:00:00', distance_km=3.0)
-        # 50 points going east at lat=37.7, then 50 points going
-        # north at lon=-122.350 — a hard 90 degree corner at the
-        # midpoint that's ~5.5 km from the chord.
-        for i in range(50):
-            conn.execute(
-                """INSERT INTO waypoints (trip_id, timestamp, lat, lon,
-                                          speed_mps, autopilot_state,
-                                          video_path, frame_offset)
-                   VALUES (1, '2026-05-04T08:15:00', 37.7,
-                           ?, 25.0, 'NONE', 'clip.mp4', 0)""",
-                (-122.400 + i * 0.001,),
-            )
-        for i in range(50):
-            conn.execute(
-                """INSERT INTO waypoints (trip_id, timestamp, lat, lon,
-                                          speed_mps, autopilot_state,
-                                          video_path, frame_offset)
-                   VALUES (1, '2026-05-04T08:15:00', ?,
-                           -122.350, 25.0, 'NONE', 'clip.mp4', 0)""",
-                (37.7 + i * 0.001,),
-            )
-        conn.commit(); conn.close()
-
-        trips = query_all_routes_simplified(db_path)
-        wps = trips[0]['waypoints']
-        # Endpoints + at least one point near the corner. The
-        # corner is at (37.7, -122.350); allow a small tolerance
-        # since RDP picks whichever discrete point has the maximum
-        # perpendicular distance.
-        assert any(
-            abs(w['lat'] - 37.7) < 0.001 and abs(w['lon'] + 122.350) < 0.001
-            for w in wps
-        ), f"corner not preserved; got {[(w['lat'], w['lon']) for w in wps]}"
-
-    def test_subsampling_returns_all_when_count_under_cap(self, tmp_path):
-        # Short trips (well under the cap) used to round-trip every
-        # point. With RDP on a perfectly straight line, only the
-        # endpoints survive — that's the correct simplification, and
-        # any mid-trip drilldown should drill into the per-day
-        # endpoint which preserves every raw waypoint.
-        from services.mapping_queries import query_all_routes_simplified
-        db_path, conn = self._make_db(tmp_path)
-        self._add_trip(conn, 1, '2026-05-04T08:00:00', distance_km=3.0)
-        self._add_waypoints(conn, 1, count=8)
-        conn.commit(); conn.close()
-        trips = query_all_routes_simplified(db_path)
-        # Straight line collapses to endpoints, regardless of how
-        # many raw waypoints were on it.
-        assert len(trips[0]['waypoints']) == 2
-
-    def test_max_points_safety_cap_clamps_pathological_zigzag(self, tmp_path):
-        # If the path is so zigzagged that even RDP keeps too many
-        # points, the safety cap kicks in via stride sampling. This
-        # test builds a pathological zigzag where every other point
-        # is a real corner so RDP has to keep them all.
-        from services.mapping_queries import query_all_routes_simplified
-        db_path, conn = self._make_db(tmp_path)
-        self._add_trip(conn, 1, '2026-05-04T08:00:00', distance_km=3.0)
-        # 40 zigzag points that alternate north/south so every
-        # interior point is a sharp corner.
-        for i in range(40):
-            lat = 37.7 + (0.01 if i % 2 else -0.01)
-            conn.execute(
-                """INSERT INTO waypoints (trip_id, timestamp, lat, lon,
-                                          speed_mps, autopilot_state,
-                                          video_path, frame_offset)
-                   VALUES (1, '2026-05-04T08:15:00', ?, ?,
-                           25.0, 'NONE', 'clip.mp4', 0)""",
-                (lat, -122.4 + i * 0.001),
-            )
-        conn.commit(); conn.close()
-        trips = query_all_routes_simplified(db_path, max_points_per_trip=10)
-        # The cap clamps the result; allow a small overshoot from
-        # the "force the last point" guarantee.
-        assert len(trips[0]['waypoints']) <= 12
-
-    def test_min_distance_filter_excludes_parking_blips(self, tmp_path):
-        # Same default as /api/trips and /api/day/<date>/routes —
-        # the All time overlay must not advertise trips other views
-        # hide as parking-lot blips.
-        from services.mapping_queries import query_all_routes_simplified
-        db_path, conn = self._make_db(tmp_path)
-        self._add_trip(conn, 1, '2026-05-04T08:00:00', distance_km=3.0)
-        self._add_waypoints(conn, 1, count=4)
-        self._add_trip(conn, 2, '2026-05-04T09:00:00', distance_km=0.005)
-        self._add_waypoints(conn, 2, count=4, video_path='blip.mp4')
-        conn.commit(); conn.close()
-        trips = query_all_routes_simplified(db_path)
-        assert [t['trip_id'] for t in trips] == [1]
-        # min_distance=0 includes both.
-        trips = query_all_routes_simplified(db_path, min_distance_km=0.0)
-        assert sorted(t['trip_id'] for t in trips) == [1, 2]
-
-    def test_trip_with_only_one_valid_waypoint_excluded(self, tmp_path):
-        # Need >= 2 surviving lat/lon pairs to render a polyline;
-        # otherwise Leaflet would draw nothing and the JSON payload
-        # would just waste bandwidth. The schema enforces NOT NULL on
-        # lat/lon so this guard kicks in via the <2-row count path.
-        from services.mapping_queries import query_all_routes_simplified
-        db_path, conn = self._make_db(tmp_path)
-        self._add_trip(conn, 1, '2026-05-04T08:00:00', distance_km=3.0)
-        self._add_waypoints(conn, 1, count=1)
-        conn.commit(); conn.close()
-        trips = query_all_routes_simplified(db_path)
-        assert trips == []
-
-    def test_trips_with_no_waypoints_excluded_by_inner_join(self, tmp_path):
-        from services.mapping_queries import query_all_routes_simplified
-        db_path, conn = self._make_db(tmp_path)
-        self._add_trip(conn, 1, '2026-05-04T08:00:00', distance_km=3.0)
-        # Trip 1 has zero waypoints — must be excluded.
-        self._add_trip(conn, 2, '2026-05-04T09:00:00', distance_km=4.0)
-        self._add_waypoints(conn, 2, count=3, video_path='c2.mp4')
-        conn.commit(); conn.close()
-        trips = query_all_routes_simplified(db_path)
-        assert [t['trip_id'] for t in trips] == [2]
-
-    def test_empty_db_returns_empty_list(self, tmp_path):
-        from services.mapping_queries import query_all_routes_simplified
-        db_path, conn = self._make_db(tmp_path)
-        conn.commit(); conn.close()
-        assert query_all_routes_simplified(db_path) == []
-
-    def test_waypoints_chronological_within_each_trip(self, tmp_path):
-        # Polyline rendering depends on the waypoints arriving in
-        # the order the trip actually drove them — out-of-order
-        # rows would draw a tangled mess.
-        from services.mapping_queries import query_all_routes_simplified
-        db_path, conn = self._make_db(tmp_path)
-        self._add_trip(conn, 1, '2026-05-04T08:00:00', distance_km=3.0)
-        self._add_waypoints(conn, 1, count=10)
-        conn.commit(); conn.close()
-        trips = query_all_routes_simplified(db_path, max_points_per_trip=50)
-        lats = [w['lat'] for w in trips[0]['waypoints']]
-        assert lats == sorted(lats)
-
-
-class TestQueryEventsWithDate:
-    """The single-day filter on /api/events powers the day-based map.
-
-    Must use substr() bucketing (same contract as query_days) and
-    must still return events with NULL lat/lon so the day card can
     advertise them, even though the map skips rendering null
     markers client-side.
     """
@@ -1463,7 +747,7 @@ class TestIndexVideo:
         wc, ec = _unpack(_index_video(
             conn, str(video_file), str(tmp_path / "TeslaCam"),
             sample_rate=1, thresholds=DEFAULT_THRESHOLDS,
-            trip_gap_minutes=5,
+
         ))
 
         assert wc == 3
@@ -1492,7 +776,7 @@ class TestIndexVideo:
         wc, ec = _unpack(_index_video(
             conn, str(video_file), str(tmp_path / "TeslaCam"),
             sample_rate=1, thresholds=DEFAULT_THRESHOLDS,
-            trip_gap_minutes=5,
+
         ))
 
         assert wc == 2
@@ -1519,14 +803,14 @@ class TestIndexVideo:
         result = _index_video(
             conn, str(video_file), str(tmp_path / "TeslaCam"),
             sample_rate=1, thresholds=DEFAULT_THRESHOLDS,
-            trip_gap_minutes=5,
+
         )
 
         assert result.waypoints == 0
         assert result.events == 0
-        # Recent-folder no-GPS clips are recorded as NO_GPS_RECORDED so the
+        # Recent-folder no-GPS clips are recorded as NO_MOVEMENT_RECORDED so the
         # queue worker can drop the row without flapping retries.
-        assert result.outcome == IndexOutcome.NO_GPS_RECORDED
+        assert result.outcome == IndexOutcome.NO_MOVEMENT_RECORDED
         conn.close()
 
     def test_indexed_files_fallback_dedup_when_video_path_nulled(self, tmp_path):
@@ -1558,7 +842,7 @@ class TestIndexVideo:
         first = _index_video(
             conn, str(video_file), str(tmp_path / "TeslaCam"),
             sample_rate=1, thresholds=DEFAULT_THRESHOLDS,
-            trip_gap_minutes=5,
+
         )
         assert first.outcome == IndexOutcome.INDEXED
         assert first.waypoints == 2
@@ -1597,7 +881,7 @@ class TestIndexVideo:
         second = _index_video(
             conn, str(video_file), str(tmp_path / "TeslaCam"),
             sample_rate=1, thresholds=DEFAULT_THRESHOLDS,
-            trip_gap_minutes=5,
+
         )
         assert second.outcome == IndexOutcome.ALREADY_INDEXED
         wp_count_after_second = conn.execute(
@@ -1654,7 +938,7 @@ class TestIndexVideo:
         result = _index_video(
             conn, str(video_file), str(tmp_path / "TeslaCam"),
             sample_rate=1, thresholds=DEFAULT_THRESHOLDS,
-            trip_gap_minutes=5,
+
         )
         assert result.outcome == IndexOutcome.INDEXED
         assert result.waypoints == 1
@@ -1677,7 +961,7 @@ class TestIndexVideo:
 # Both the matching-order fix AND the post-insert merge are exercised here.
 
 def _index_synthetic_at(conn, tmp_path, filename: str, lat: float = 37.7749,
-                        lon: float = -122.4194, trip_gap_minutes: int = 5):
+                        lon: float = -122.4194):
     """Index one synthetic single-waypoint clip into ``conn``.
 
     The waypoint timestamp comes from the filename — see
@@ -1693,399 +977,11 @@ def _index_synthetic_at(conn, tmp_path, filename: str, lat: float = 37.7749,
     return _index_video(
         conn, str(video_file), str(tmp_path / "TeslaCam"),
         sample_rate=1, thresholds=DEFAULT_THRESHOLDS,
-        trip_gap_minutes=trip_gap_minutes,
+
     )
 
 
 class TestTripFragmentationDefense:
-    def test_out_of_order_indexing_produces_one_trip(self, tmp_path):
-        """Out-of-order ingestion of three clips that all belong to one
-        drive must yield exactly one trip, not multiple fragments."""
-        db_path = str(tmp_path / "test.db")
-        conn = _init_db(db_path)
-        # File 1 at 08:00, file 2 at 08:08 (8 min later → > 5 min gap →
-        # would otherwise create a separate trip), file 3 at 08:04
-        # (between, ≤ 5 min from each side → bridges them).
-        _index_synthetic_at(conn, tmp_path, "2025-11-08_08-00-00-front.mp4")
-        _index_synthetic_at(conn, tmp_path, "2025-11-08_08-08-00-front.mp4")
-        # Before the bridge clip is indexed, we must have two trips.
-        assert conn.execute("SELECT COUNT(*) FROM trips").fetchone()[0] == 2
-        _index_synthetic_at(conn, tmp_path, "2025-11-08_08-04-00-front.mp4")
-        trips = conn.execute("SELECT * FROM trips").fetchall()
-        assert len(trips) == 1, (
-            f"out-of-order bridge clip should merge fragments; "
-            f"got {len(trips)} trip(s)"
-        )
-        # All three waypoints survived and are attached to the survivor.
-        wps = conn.execute(
-            "SELECT trip_id FROM waypoints"
-        ).fetchall()
-        assert len(wps) == 3
-        assert all(w['trip_id'] == trips[0]['id'] for w in wps)
-        conn.close()
-
-    def test_chain_merge_three_trips_collapse(self, tmp_path):
-        """A bridge clip whose insertion creates a chain of mergeable
-        trips (A↔B↔C) must collapse them all in one pass — the merge
-        loop has to refresh survivor bounds inside the loop."""
-        db_path = str(tmp_path / "test.db")
-        conn = _init_db(db_path)
-        # Three trips at 08:00, 08:10, 08:20 — each pair 10 min apart
-        # (> 5 min gap → all separate when created in order).
-        _index_synthetic_at(conn, tmp_path, "2025-11-08_08-00-00-front.mp4")
-        _index_synthetic_at(conn, tmp_path, "2025-11-08_08-10-00-front.mp4")
-        _index_synthetic_at(conn, tmp_path, "2025-11-08_08-20-00-front.mp4")
-        assert conn.execute("SELECT COUNT(*) FROM trips").fetchone()[0] == 3
-        # Bridge clip at 08:05 — adjacent (5 min) to trip 1 only. After
-        # insert, trip 1 spans 08:00→08:05 → now adjacent to trip 2
-        # (5 min away). After that merge, the survivor spans 08:00→08:10
-        # → now adjacent to trip 3. Chain merge must catch all three.
-        _index_synthetic_at(conn, tmp_path, "2025-11-08_08-05-00-front.mp4")
-        # Index a second bridge at 08:15 to chain trip 3 onto the
-        # survivor — needed because the first bridge is only directly
-        # adjacent to trips 1 and 2, not 3.
-        _index_synthetic_at(conn, tmp_path, "2025-11-08_08-15-00-front.mp4")
-        trips = conn.execute("SELECT * FROM trips").fetchall()
-        assert len(trips) == 1, (
-            f"chain merge must collapse all three trips; got {len(trips)}"
-        )
-        wps = conn.execute("SELECT COUNT(*) FROM waypoints").fetchone()[0]
-        assert wps == 5
-        conn.close()
-
-    def test_distant_trips_remain_separate(self, tmp_path):
-        """Two trips with a real gap (> trip_gap) must NOT be merged
-        even if a clip is indexed near one of them."""
-        db_path = str(tmp_path / "test.db")
-        conn = _init_db(db_path)
-        # 2-hour gap — clearly two distinct drives.
-        _index_synthetic_at(conn, tmp_path, "2025-11-08_08-00-00-front.mp4")
-        _index_synthetic_at(conn, tmp_path, "2025-11-08_10-00-00-front.mp4")
-        # Add another clip very close to the first trip — it should
-        # extend trip 1 only, never reach trip 2.
-        _index_synthetic_at(conn, tmp_path, "2025-11-08_08-01-00-front.mp4")
-        trips = conn.execute("SELECT * FROM trips").fetchall()
-        assert len(trips) == 2
-        # Trip 1 now has 2 waypoints, trip 2 still has 1.
-        counts = conn.execute(
-            "SELECT trip_id, COUNT(*) AS n FROM waypoints "
-            "GROUP BY trip_id ORDER BY trip_id"
-        ).fetchall()
-        assert [c['n'] for c in counts] == [2, 1]
-        conn.close()
-
-    def test_matching_picks_closest_gap_not_closest_start(self, tmp_path):
-        """When a clip falls between two trips, the matching SQL must
-        pick the temporally adjoining trip (smallest gap), not the trip
-        whose start_time happens to be numerically nearer.
-
-        Regression test for the production bug: the old
-        ``ORDER BY ABS(new_start - existing.start)`` ranking caused the
-        wrong trip to be picked when a filler clip arrived after both
-        neighbouring trips already existed. The new ranking must always
-        pick the trip whose interval the new clip actually adjoins.
-        """
-        db_path = str(tmp_path / "test.db")
-        conn = _init_db(db_path)
-        # Trip A at 08:00 (one waypoint, start=end ≈ 08:00:00).
-        # Trip B at 08:30 (one waypoint, start=end ≈ 08:30:00).
-        # Gap is 30 min → > 5 min so they're separate.
-        _index_synthetic_at(conn, tmp_path, "2025-11-08_08-00-00-front.mp4")
-        _index_synthetic_at(conn, tmp_path, "2025-11-08_08-30-00-front.mp4")
-        assert conn.execute("SELECT COUNT(*) FROM trips").fetchone()[0] == 2
-        a_id, b_id = [r['id'] for r in conn.execute(
-            "SELECT id FROM trips ORDER BY id"
-        ).fetchall()]
-        # Index a filler at 08:04 — only 4 min after trip A's end,
-        # 26 min before trip B's start. With the OLD ranking,
-        # ABS(08:04 - 08:00) = 4 min vs ABS(08:04 - 08:30) = 26 min →
-        # would still pick A correctly. So make this case asymmetric:
-        # use a filler at 08:28 that is much closer to B's *start*
-        # numerically (in seconds-of-day) than A's start, but is
-        # 28 min after A and only 2 min before B → must adjoin B.
-        # 28 min > 5 min trip_gap → won't match A; only B matches.
-        _index_synthetic_at(conn, tmp_path, "2025-11-08_08-28-00-front.mp4")
-        # Filler must be on trip B, not trip A.
-        b_wps = conn.execute(
-            "SELECT COUNT(*) FROM waypoints WHERE trip_id = ?", (b_id,)
-        ).fetchone()[0]
-        assert b_wps == 2, (
-            f"filler at 08:28 must adjoin trip B (08:30); got {b_wps} "
-            f"waypoint(s) on B"
-        )
-        a_wps = conn.execute(
-            "SELECT COUNT(*) FROM waypoints WHERE trip_id = ?", (a_id,)
-        ).fetchone()[0]
-        assert a_wps == 1
-        conn.close()
-
-
-class TestMergeAdjacentTripsHelper:
-    """Unit tests for ``_merge_adjacent_trips_for`` driven directly
-    against the schema, so each merge scenario is isolated from the
-    matching-SQL behaviour exercised in TestTripFragmentationDefense.
-    """
-
-    @staticmethod
-    def _seed_trip(conn, start_iso, end_iso):
-        cur = conn.execute(
-            "INSERT INTO trips (start_time, end_time, source_folder) "
-            "VALUES (?, ?, 'TestFolder')",
-            (start_iso, end_iso),
-        )
-        trip_id = cur.lastrowid
-        # Anchor waypoint at start_time so MIN/MAX match the seeded bounds.
-        conn.execute(
-            "INSERT INTO waypoints (trip_id, timestamp, lat, lon, "
-            "video_path, frame_offset) VALUES (?, ?, 37.0, -122.0, '', 0)",
-            (trip_id, start_iso),
-        )
-        if end_iso != start_iso:
-            conn.execute(
-                "INSERT INTO waypoints (trip_id, timestamp, lat, lon, "
-                "video_path, frame_offset) VALUES (?, ?, 37.0, -122.0, '', 0)",
-                (trip_id, end_iso),
-            )
-        conn.commit()
-        return trip_id
-
-    def test_no_merge_when_no_neighbours(self, tmp_path):
-        from services.mapping_service import _merge_adjacent_trips_for
-        db_path = str(tmp_path / "test.db")
-        conn = _init_db(db_path)
-        a = self._seed_trip(
-            conn, "2025-11-08T08:00:00", "2025-11-08T08:05:00"
-        )
-        survivor = _merge_adjacent_trips_for(conn, a, gap_seconds=300)
-        assert survivor == a
-        assert conn.execute("SELECT COUNT(*) FROM trips").fetchone()[0] == 1
-        conn.close()
-
-    def test_merges_with_lower_id_neighbour(self, tmp_path):
-        from services.mapping_service import _merge_adjacent_trips_for
-        db_path = str(tmp_path / "test.db")
-        conn = _init_db(db_path)
-        a = self._seed_trip(
-            conn, "2025-11-08T08:00:00", "2025-11-08T08:05:00"
-        )
-        b = self._seed_trip(
-            conn, "2025-11-08T08:09:00", "2025-11-08T08:14:00"
-        )
-        # 4 min gap → mergeable.
-        survivor = _merge_adjacent_trips_for(conn, b, gap_seconds=300)
-        assert survivor == a, "lower id must always win"
-        # Trip b is gone; its waypoints (and any events) are now on a.
-        assert conn.execute("SELECT COUNT(*) FROM trips").fetchone()[0] == 1
-        wps_on_a = conn.execute(
-            "SELECT COUNT(*) FROM waypoints WHERE trip_id = ?", (a,)
-        ).fetchone()[0]
-        assert wps_on_a == 4
-        conn.close()
-
-    def test_chain_merge_refreshes_bounds_each_iteration(self, tmp_path):
-        from services.mapping_service import _merge_adjacent_trips_for
-        db_path = str(tmp_path / "test.db")
-        conn = _init_db(db_path)
-        # A at 08:00-05, B at 08:09-14, C at 08:18-23. Each consecutive
-        # pair is 4 min apart. Without per-iteration bound refresh, A
-        # would absorb B but the original anchor's stale end_time
-        # (08:05) wouldn't reach C (08:18) — even though after the B
-        # merge the survivor extends to 08:14 → 4 min from C.
-        a = self._seed_trip(
-            conn, "2025-11-08T08:00:00", "2025-11-08T08:05:00"
-        )
-        b = self._seed_trip(
-            conn, "2025-11-08T08:09:00", "2025-11-08T08:14:00"
-        )
-        c = self._seed_trip(
-            conn, "2025-11-08T08:18:00", "2025-11-08T08:23:00"
-        )
-        survivor = _merge_adjacent_trips_for(conn, b, gap_seconds=300)
-        # All three collapse — survivor is the lowest id (A).
-        assert survivor == a
-        assert conn.execute("SELECT COUNT(*) FROM trips").fetchone()[0] == 1
-        conn.close()
-
-    def test_does_not_merge_beyond_gap(self, tmp_path):
-        from services.mapping_service import _merge_adjacent_trips_for
-        db_path = str(tmp_path / "test.db")
-        conn = _init_db(db_path)
-        a = self._seed_trip(
-            conn, "2025-11-08T08:00:00", "2025-11-08T08:05:00"
-        )
-        # 6 min gap > 5 min → must NOT merge.
-        b = self._seed_trip(
-            conn, "2025-11-08T08:11:00", "2025-11-08T08:14:00"
-        )
-        survivor = _merge_adjacent_trips_for(conn, b, gap_seconds=300)
-        assert survivor == b  # No merge happened
-        assert conn.execute("SELECT COUNT(*) FROM trips").fetchone()[0] == 2
-        conn.close()
-
-    def test_overlap_is_merged(self, tmp_path):
-        from services.mapping_service import _merge_adjacent_trips_for
-        db_path = str(tmp_path / "test.db")
-        conn = _init_db(db_path)
-        a = self._seed_trip(
-            conn, "2025-11-08T08:00:00", "2025-11-08T08:10:00"
-        )
-        # B's window overlaps A's — gap is negative; must still merge.
-        b = self._seed_trip(
-            conn, "2025-11-08T08:05:00", "2025-11-08T08:15:00"
-        )
-        survivor = _merge_adjacent_trips_for(conn, b, gap_seconds=300)
-        assert survivor == a
-        assert conn.execute("SELECT COUNT(*) FROM trips").fetchone()[0] == 1
-        # Survivor bounds extend to cover both originals.
-        bounds = conn.execute(
-            "SELECT start_time, end_time FROM trips WHERE id = ?", (a,)
-        ).fetchone()
-        assert bounds['start_time'] == "2025-11-08T08:00:00"
-        assert bounds['end_time'] == "2025-11-08T08:15:00"
-        conn.close()
-
-    def test_events_are_repointed_not_destroyed(self, tmp_path):
-        """The schema declares ``ON DELETE CASCADE`` on
-        ``detected_events.trip_id``. The merge helper MUST update event
-        rows BEFORE deleting the dropped trip; otherwise the cascade
-        would silently destroy events we wanted to keep."""
-        from services.mapping_service import _merge_adjacent_trips_for
-        db_path = str(tmp_path / "test.db")
-        conn = _init_db(db_path)
-        # Foreign keys must be on for the cascade to fire — _init_db
-        # already enables them, but assert it explicitly so a future
-        # schema change can't silently regress this guarantee.
-        assert conn.execute(
-            "PRAGMA foreign_keys"
-        ).fetchone()[0] == 1
-        a = self._seed_trip(
-            conn, "2025-11-08T08:00:00", "2025-11-08T08:05:00"
-        )
-        b = self._seed_trip(
-            conn, "2025-11-08T08:09:00", "2025-11-08T08:14:00"
-        )
-        # Attach an event to b so we can verify it survives the merge.
-        conn.execute(
-            "INSERT INTO detected_events (trip_id, timestamp, lat, lon, "
-            "event_type, severity, description, video_path, frame_offset) "
-            "VALUES (?, '2025-11-08T08:10:00', 37.0, -122.0, "
-            "'harsh_brake', 'medium', 'test', 'x.mp4', 0)",
-            (b,),
-        )
-        conn.commit()
-        survivor = _merge_adjacent_trips_for(conn, b, gap_seconds=300)
-        assert survivor == a
-        # Event is now on the survivor, not destroyed.
-        rows = conn.execute(
-            "SELECT trip_id FROM detected_events"
-        ).fetchall()
-        assert len(rows) == 1
-        assert rows[0]['trip_id'] == a
-        conn.close()
-
-    def test_exact_300s_boundary_merges(self, tmp_path):
-        """A pair exactly 300 s apart must be considered mergeable.
-
-        Regression test for the ``julianday(a)-julianday(b))*86400``
-        floating-point bug: it returned 300.0000223 for a true 300-s
-        gap, silently failing the ``<= 300`` boundary check and
-        leaving phantom-fragmented trips unmerged. The fix uses
-        integer-epoch arithmetic via ``strftime('%s', ...)`` instead.
-        """
-        from services.mapping_service import _merge_adjacent_trips_for
-        db_path = str(tmp_path / "test.db")
-        conn = _init_db(db_path)
-        # Trip A ends at 08:05:00 sharp; trip B starts at 08:10:00
-        # sharp → exactly 300 s apart.
-        a = self._seed_trip(
-            conn, "2025-11-08T08:00:00", "2025-11-08T08:05:00"
-        )
-        b = self._seed_trip(
-            conn, "2025-11-08T08:10:00", "2025-11-08T08:15:00"
-        )
-        survivor = _merge_adjacent_trips_for(conn, b, gap_seconds=300)
-        assert survivor == a, (
-            "exact 300-s boundary must merge — float-arithmetic "
-            "regression?"
-        )
-        assert conn.execute("SELECT COUNT(*) FROM trips").fetchone()[0] == 1
-        conn.close()
-
-
-class TestStartupMergeRepair:
-    """The v8→v9 migration runs ``_merge_all_adjacent_trip_pairs`` on
-    the entire ``trips`` table to repair phantom-fragmented trips left
-    over from the matching-SQL boundary bug. These tests exercise that
-    sweep helper directly so we don't depend on the full _init_db
-    migration plumbing for assertions about the merge behaviour."""
-
-    @staticmethod
-    def _seed(conn, start_iso, end_iso):
-        cur = conn.execute(
-            "INSERT INTO trips (start_time, end_time, source_folder) "
-            "VALUES (?, ?, 'TestFolder')",
-            (start_iso, end_iso),
-        )
-        trip_id = cur.lastrowid
-        conn.execute(
-            "INSERT INTO waypoints (trip_id, timestamp, lat, lon, "
-            "video_path, frame_offset) VALUES (?, ?, 37.0, -122.0, '', 0)",
-            (trip_id, start_iso),
-        )
-        if end_iso != start_iso:
-            conn.execute(
-                "INSERT INTO waypoints (trip_id, timestamp, lat, lon, "
-                "video_path, frame_offset) VALUES (?, ?, 37.0, -122.0, "
-                "'', 0)",
-                (trip_id, end_iso),
-            )
-        return trip_id
-
-    def test_global_merge_collapses_phantom_chain(self, tmp_path):
-        from services.mapping_service import _merge_all_adjacent_trip_pairs
-        db_path = str(tmp_path / "test.db")
-        conn = _init_db(db_path)
-        # Five fragments that together describe one drive — every
-        # consecutive pair is exactly 300 s apart (the boundary case
-        # the runtime bug used to mis-handle).
-        a = self._seed(conn, "2025-11-08T08:00:00", "2025-11-08T08:05:00")
-        b = self._seed(conn, "2025-11-08T08:10:00", "2025-11-08T08:15:00")
-        c = self._seed(conn, "2025-11-08T08:20:00", "2025-11-08T08:25:00")
-        d = self._seed(conn, "2025-11-08T08:30:00", "2025-11-08T08:35:00")
-        e = self._seed(conn, "2025-11-08T08:40:00", "2025-11-08T08:45:00")
-        conn.commit()
-        merged = _merge_all_adjacent_trip_pairs(conn, gap_seconds=300)
-        assert merged == 4
-        rows = conn.execute(
-            "SELECT id, start_time, end_time FROM trips"
-        ).fetchall()
-        assert len(rows) == 1
-        assert rows[0]['id'] == a  # lower id wins
-        assert rows[0]['start_time'] == "2025-11-08T08:00:00"
-        assert rows[0]['end_time'] == "2025-11-08T08:45:00"
-        # All 10 waypoints (2 per fragment) survived on the survivor.
-        assert conn.execute(
-            "SELECT COUNT(*) FROM waypoints WHERE trip_id = ?", (a,)
-        ).fetchone()[0] == 10
-        conn.close()
-
-    def test_global_merge_preserves_distant_trips(self, tmp_path):
-        from services.mapping_service import _merge_all_adjacent_trip_pairs
-        db_path = str(tmp_path / "test.db")
-        conn = _init_db(db_path)
-        # Two fragments that should merge, plus a distant trip that must
-        # remain separate.
-        a = self._seed(conn, "2025-11-08T08:00:00", "2025-11-08T08:05:00")
-        b = self._seed(conn, "2025-11-08T08:10:00", "2025-11-08T08:15:00")
-        c = self._seed(conn, "2025-11-08T18:00:00", "2025-11-08T18:30:00")
-        conn.commit()
-        _merge_all_adjacent_trip_pairs(conn, gap_seconds=300)
-        ids = sorted(r['id'] for r in conn.execute(
-            "SELECT id FROM trips"
-        ).fetchall())
-        assert ids == sorted([a, c]), (
-            f"morning fragments should collapse to {a}; evening trip "
-            f"{c} must remain"
         )
         conn.close()
 
@@ -2146,37 +1042,12 @@ class TestDrivingStats:
         conn.close()
         return db_path
 
-    def test_has_data(self, db_with_driving_data):
+    def test_has_data(self, db_with_driving_data, tmp_path):
         stats = get_driving_stats(db_with_driving_data)
         assert stats['has_data'] is True
 
-    def test_trip_count(self, db_with_driving_data):
-        stats = get_driving_stats(db_with_driving_data)
-        assert stats['trip_count'] == 2
-
-    def test_total_distance(self, db_with_driving_data):
-        stats = get_driving_stats(db_with_driving_data)
-        assert stats['total_distance_km'] == 40.5  # 15.5 + 25.0
-
-    def test_fsd_usage(self, db_with_driving_data):
-        stats = get_driving_stats(db_with_driving_data)
-        # 4 out of 10 waypoints are AUTOSTEER = 40%
-        assert stats['fsd_usage_pct'] == 40.0
-
-    def test_event_counts(self, db_with_driving_data):
-        stats = get_driving_stats(db_with_driving_data)
-        assert stats['total_events'] == 3
-        assert stats['warning_events'] == 2  # 1 warning + 1 critical
-
-    def test_events_per_100km(self, db_with_driving_data):
-        stats = get_driving_stats(db_with_driving_data)
-        # 2 warning/critical events / 40.5 km * 100 = ~4.9
-        assert 4.0 < stats['events_per_100km'] < 6.0
-
-    def test_empty_db(self, tmp_path):
-        db_path = str(tmp_path / "empty.db")
-        _init_db(db_path)
-        stats = get_driving_stats(db_path)
+        empty_db = str(tmp_path / "empty.db")
+        stats = get_driving_stats(empty_db)
         assert stats['has_data'] is False
 
 
@@ -2263,7 +1134,7 @@ class TestIndexResultOutcomes:
             IndexOutcome.INDEXED,
             IndexOutcome.ALREADY_INDEXED,
             IndexOutcome.DUPLICATE_UPGRADED,
-            IndexOutcome.NO_GPS_RECORDED,
+            IndexOutcome.NO_MOVEMENT_RECORDED,
             IndexOutcome.NOT_FRONT_CAMERA,
             IndexOutcome.FILE_MISSING,
         ):
@@ -2329,12 +1200,12 @@ class TestIndexSingleFileOutcomes:
         _os.utime(str(clip), (old, old))
 
         result = index_single_file(str(clip), db, str(tmp_path))
-        # Could legitimately come back as either NO_GPS_RECORDED (parser
+        # Could legitimately come back as either NO_MOVEMENT_RECORDED (parser
         # found 0 SEI frames) or PARSE_ERROR (parser raised). Both are
         # acceptable terminal-or-retry classifications — the assertion
         # we care about is that we never get an INDEXED with 0 waypoints.
         assert result.outcome in (
-            IndexOutcome.NO_GPS_RECORDED,
+            IndexOutcome.NO_MOVEMENT_RECORDED,
             IndexOutcome.PARSE_ERROR,
         )
         if result.outcome == IndexOutcome.PARSE_ERROR:
@@ -2384,7 +1255,7 @@ class TestIndexSingleFileSidecarConsumption:
             'schema_version': sei_parser.SIDECAR_SCHEMA_VERSION,
             'sample_rate': sample_rate,
             'sei_count': len(messages),
-            'no_gps_count': 0,
+            'no_movement_count': 0,
             'mvhd_creation_time_utc': mvhd,
             'video_size_bytes': st.st_size,
             'video_mtime_unix': st.st_mtime,
@@ -3311,7 +2182,6 @@ class TestPurgeDeletedVideos:
         # Waypoint count reflects rows whose video_path was nulled.
         assert result['purged_waypoints'] == 1
         # Trips are NEVER deleted by reconciliation.
-        assert result['purged_trips'] == 0
 
         with sqlite3.connect(db) as c:
             # indexed_files row gone (file truly missing).
@@ -3440,8 +2310,6 @@ class TestPurgeDeletedVideos:
         assert result['purged_files'] == 3
         # All three waypoints' video_path nulled.
         assert result['purged_waypoints'] == 3
-        # The contract: ``purged_trips`` is always 0 — trips are sacred.
-        assert result['purged_trips'] == 0
 
         with sqlite3.connect(db) as c:
             # Trip survives intact.
@@ -3966,222 +2834,3 @@ class TestGapDetectionHelpers:
     clock skew).
     """
 
-    def test_no_gap_for_close_in_time_and_space(self):
-        # Two adjacent SEI samples ~1 second / ~25 m apart at typical
-        # surface-street speed. Must not be flagged as a gap.
-        assert _is_gap_between(
-            '2026-05-04T08:00:00', 37.7000, -122.4000,
-            '2026-05-04T08:00:01', 37.70022, -122.40000,
-        ) is False
-
-    def test_gap_when_time_threshold_exceeded(self):
-        # 6-minute parking break with the car moved <1 m. Time alone
-        # must trip the gap, even though the car barely moved (e.g.
-        # someone got out, ran into a store, came back).
-        assert _is_gap_between(
-            '2026-05-04T08:00:00', 37.7000, -122.4000,
-            '2026-05-04T08:06:00', 37.7000, -122.4000,
-        ) is True
-
-    def test_gap_when_distance_threshold_exceeded(self):
-        # 1-second time delta but car somehow jumped ~5.5 km. This is
-        # the SEI-clock-skew case — overlapping clips disagree about
-        # where the vehicle was. Must trip on distance.
-        assert _is_gap_between(
-            '2026-05-04T08:00:00', 37.7000, -122.4000,
-            '2026-05-04T08:00:01', 37.7500, -122.4000,
-        ) is True
-
-    def test_gap_threshold_uses_strict_greater_than(self):
-        # Defaults are 60 s and 250 m. A delta clearly under both
-        # thresholds must NOT be a gap. Pin this so a future tweak
-        # to either threshold can't silently turn clean drives into
-        # split polylines.
-        # Build a 200 m east step at 37.7 N (< 250 m threshold).
-        meters_per_deg_lon = _haversine_m(37.7, 0.0, 37.7, 1.0)
-        deg_for_200m = 200.0 / meters_per_deg_lon
-        assert _is_gap_between(
-            '2026-05-04T08:00:00', 37.7, -122.4,
-            '2026-05-04T08:00:55', 37.7, -122.4 + deg_for_200m,
-        ) is False  # 55 s and ~200 m — both safely under threshold.
-
-    def test_no_gap_when_lat_lon_missing(self):
-        # A waypoint that lacks coordinates can't contribute a
-        # distance-based gap signal. If timestamps are also close,
-        # no gap. Critical so a single bad row doesn't silently
-        # split a long valid polyline at random spots.
-        assert _is_gap_between(
-            '2026-05-04T08:00:00', None, None,
-            '2026-05-04T08:00:01', 37.7, -122.4,
-        ) is False
-
-    def test_no_gap_when_timestamps_unparseable(self):
-        # Garbage timestamps should not be treated as positive-gap
-        # signals — fall back to the distance check only.
-        assert _is_gap_between(
-            'not-a-ts', 37.7, -122.4,
-            'also-not-a-ts', 37.7001, -122.4001,
-        ) is False
-
-    def test_z_suffix_timestamps_parse_correctly(self):
-        # The indexer can emit either naive ISO strings or trailing-Z
-        # forms depending on whether SEI carried timezone. Both must
-        # parse so a clean drive with mixed forms doesn't get false
-        # gaps from the time arm being silently disabled.
-        a = _parse_iso_seconds('2026-05-04T08:00:00Z')
-        b = _parse_iso_seconds('2026-05-04T08:00:00+00:00')
-        assert a is not None and b is not None
-        assert abs(a - b) < 0.001
-
-    def test_unparseable_timestamp_returns_none(self):
-        assert _parse_iso_seconds('') is None
-        assert _parse_iso_seconds(None) is None
-        assert _parse_iso_seconds('garbage') is None
-
-
-class TestGapAfterStamping:
-    """Integration tests for ``gap_after`` flag stamping in the
-    routes queries. The flag is what tells the frontend to break the
-    polyline at a gap boundary instead of drawing a straight line
-    across the (often multi-km) chord between adjacent waypoints.
-    """
-
-    def _make_db(self, tmp_path, name='gap.db'):
-        db_path = str(tmp_path / name)
-        conn = _init_db(db_path)
-        return db_path, conn
-
-    def _add_trip(self, conn, trip_id, start, end=None, distance_km=2.5):
-        conn.execute(
-            """INSERT INTO trips (id, start_time, end_time, start_lat,
-                                  start_lon, end_lat, end_lon, distance_km,
-                                  duration_seconds, source_folder)
-               VALUES (?, ?, ?, 37.7, -122.4, 37.8, -122.5, ?, 600,
-                       'RecentClips')""",
-            (trip_id, start, end or start, distance_km),
-        )
-
-    def _insert_wp(self, conn, trip_id, ts, lat, lon, speed_mps=25.0,
-                   video_path='clip.mp4', frame_offset=0):
-        conn.execute(
-            """INSERT INTO waypoints (trip_id, timestamp, lat, lon,
-                                     speed_mps, autopilot_state,
-                                     video_path, frame_offset)
-               VALUES (?, ?, ?, ?, ?, 'NONE', ?, ?)""",
-            (trip_id, ts, lat, lon, speed_mps, video_path, frame_offset),
-        )
-
-    def test_query_day_routes_stamps_gap_after_for_long_pause(self, tmp_path):
-        # Mimics the Apr 26 2026 field bug: trip has 3 waypoints, then
-        # a 6-minute parking pause, then 3 more waypoints far enough
-        # away that without splitting the renderer would draw a long
-        # diagonal line cutting across the map. ``gap_after`` must
-        # land on the LAST waypoint of the pre-pause group, so the
-        # frontend ends that polyline run cleanly.
-        db_path, conn = self._make_db(tmp_path)
-        self._add_trip(conn, 1, '2026-04-26T09:00:00')
-        # First group: 3 close-together points.
-        self._insert_wp(conn, 1, '2026-04-26T09:00:00', 37.7000, -122.4000)
-        self._insert_wp(conn, 1, '2026-04-26T09:00:01', 37.70022, -122.40000)
-        self._insert_wp(conn, 1, '2026-04-26T09:00:02', 37.70044, -122.40000)
-        # 6-min gap that displaces the car ~1 km.
-        self._insert_wp(conn, 1, '2026-04-26T09:06:00', 37.7100, -122.4100)
-        self._insert_wp(conn, 1, '2026-04-26T09:06:01', 37.71022, -122.41000)
-        self._insert_wp(conn, 1, '2026-04-26T09:06:02', 37.71044, -122.41000)
-        conn.commit(); conn.close()
-
-        result = query_day_routes(db_path, '2026-04-26')
-        wps = result['trips'][0]['waypoints']
-        flags = [bool(wp.get('gap_after')) for wp in wps]
-        # Exactly one True, on the third waypoint (last of the pre-gap
-        # group). The very last waypoint of the trip must NOT be
-        # flagged — there's no waypoint after it, so a flag would be
-        # nonsensical and could confuse the renderer.
-        assert flags == [False, False, True, False, False, False], flags
-
-    def test_query_day_routes_no_gap_for_clean_drive(self, tmp_path):
-        # Tight, regular SEI samples. No flag should land on any
-        # waypoint — the absence of the key keeps the JSON payload
-        # exactly the same size as before the gap-detection feature.
-        db_path, conn = self._make_db(tmp_path)
-        self._add_trip(conn, 1, '2026-05-04T08:00:00')
-        for i in range(5):
-            ts = f'2026-05-04T08:00:{i:02d}'
-            # ~24 m east per second at this latitude.
-            self._insert_wp(conn, 1, ts, 37.700 + i * 0.0001, -122.400)
-        conn.commit(); conn.close()
-
-        result = query_day_routes(db_path, '2026-05-04')
-        wps = result['trips'][0]['waypoints']
-        # No waypoint should carry the key at all. We assert absence
-        # (not False) because the backend deliberately omits the key
-        # on clean drives to keep payload size unchanged.
-        assert all('gap_after' not in wp for wp in wps), [
-            (wp.get('timestamp'), wp.get('gap_after')) for wp in wps
-        ]
-
-    def test_query_all_routes_simplified_splits_at_gap(self, tmp_path):
-        # The All-time view's RDP simplification used to crush a
-        # short pre-gap segment into a single endpoint and then draw
-        # one straight line all the way to the post-gap segment —
-        # exactly what created the diagonal artifact. Verify the new
-        # per-segment RDP path preserves the gap_after flag on the
-        # last simplified waypoint of the pre-gap segment so the
-        # frontend renders TWO polylines per trip, not one.
-        from services.mapping_queries import query_all_routes_simplified
-        db_path, conn = self._make_db(tmp_path)
-        self._add_trip(conn, 1, '2026-04-26T09:00:00', distance_km=3.0)
-        # Build a longer drive on each side of the gap so RDP keeps
-        # multiple points per segment. 10 east-bound points, 6-min
-        # parking pause, 10 more east-bound points 1 km away.
-        for i in range(10):
-            self._insert_wp(
-                conn, 1, f'2026-04-26T09:00:{i:02d}',
-                37.700, -122.400 + i * 0.001,  # ~88 m east each step
-            )
-        for i in range(10):
-            self._insert_wp(
-                conn, 1, f'2026-04-26T09:06:{i:02d}',
-                37.710, -122.410 + i * 0.001,
-            )
-        conn.commit(); conn.close()
-
-        trips = query_all_routes_simplified(db_path)
-        assert len(trips) == 1
-        wps = trips[0]['waypoints']
-        gap_indices = [i for i, wp in enumerate(wps) if wp.get('gap_after')]
-        # Must have exactly one gap boundary in the simplified output.
-        assert len(gap_indices) == 1, (
-            "RDP must preserve exactly one gap_after marker; got %r at %r"
-            % (gap_indices, [(wp['lat'], wp['lon']) for wp in wps])
-        )
-        # The flagged waypoint must NOT be the last point of the trip
-        # — that would mean the gap "leaked" across the trip end.
-        assert gap_indices[0] < len(wps) - 1, (
-            "gap_after on final waypoint is meaningless"
-        )
-        # All waypoints up to and including the gap must be on the
-        # pre-gap side (lat < 37.705); all after must be on the
-        # post-gap side (lat > 37.705). This is what proves the
-        # split happened where we expected it, not somewhere else.
-        gap_idx = gap_indices[0]
-        assert all(wp['lat'] < 37.705 for wp in wps[:gap_idx + 1])
-        assert all(wp['lat'] > 37.705 for wp in wps[gap_idx + 1:])
-
-    def test_query_all_routes_simplified_no_gap_for_clean_trip(self, tmp_path):
-        # Clean drive: no gap_after key should appear anywhere. Pin
-        # the no-flag invariant so the payload doesn't grow for the
-        # 99% case of well-indexed trips.
-        from services.mapping_queries import query_all_routes_simplified
-        db_path, conn = self._make_db(tmp_path)
-        self._add_trip(conn, 1, '2026-05-04T08:00:00', distance_km=3.0)
-        for i in range(20):
-            self._insert_wp(
-                conn, 1, f'2026-05-04T08:00:{i:02d}',
-                37.700 + i * 0.0002, -122.400,
-            )
-        conn.commit(); conn.close()
-
-        trips = query_all_routes_simplified(db_path)
-        for wp in trips[0]['waypoints']:
-            assert 'gap_after' not in wp

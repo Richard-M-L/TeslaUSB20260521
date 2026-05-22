@@ -82,7 +82,6 @@ MAX_UPLOAD_CHUNK_MB = int(config['web'].get('max_upload_chunk_mb', 16))
 _mapping = config.get('mapping', {})
 MAPPING_ENABLED = bool(_mapping.get('enabled', False))
 MAPPING_SAMPLE_RATE = int(_mapping.get('sample_rate', 30))
-MAPPING_TRIP_GAP_MINUTES = int(_mapping.get('trip_gap_minutes', 5))
 # Phase 5.9 (issue #102) — too-new gate exposed via Settings → Advanced.
 MAPPING_INDEX_TOO_NEW_SECONDS = float(_mapping.get('index_too_new_seconds', 120))
 MAPPING_DB_PATH = os.path.join(GADGET_DIR, 'geodata.db')

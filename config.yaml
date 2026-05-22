@@ -95,9 +95,8 @@ web:
 # Mapping & Geo-Indexing Configuration
 # ============================================================================
 mapping:
-  enabled: true                          # Enable GPS/telemetry indexing of dashcam videos
+  enabled: true                          # Enable telemetry indexing and event detection
   sample_rate: 30                        # Extract every Nth frame (30 = ~1/sec at 30fps)
-  trip_gap_minutes: 5                    # Gap between waypoints to start a new trip
   # Phase 5.9 (issue #102) — exposed via Settings → Advanced.
   index_too_new_seconds: 120             # Skip indexing for clips whose mtime is fresher than this many seconds (Tesla still writing)
   event_detection:

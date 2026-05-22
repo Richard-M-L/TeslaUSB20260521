@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TeslaUSB — Events Dashboard (China Edition Demo)</title>
+<style>
+:root {
+  --bg: #1a1a2e;
+  --bg-card: #16213e;
+  --bg-hover: #1f2b47;
+  --text: #e0e0e0;
+  --text-secondary: #8899aa;
+  --accent: #3b82f6;
+  --accent-dim: #2563eb;
+  --danger: #ef4444;
+  --warning: #f59e0b;
+  --success: #22c55e;
+  --info: #3b82f6;
+  --border: #2a3a4e;
+  --radius: 8px;
+  --gap: 12px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+}
+
+/* ── Top bar ── */
+.topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 16px; background: var(--bg-card); border-bottom: 1px solid var(--border);
+}
+.topbar h1 { font-size: 1.1rem; font-weight: 600; }
+.topbar .actions { display: flex; gap: 8px; }
+.btn {
+  padding: 6px 14px; border-radius: var(--radius); border: 1px solid var(--border);
+  background: var(--bg-card); color: var(--text); cursor: pointer; font-size: 0.82rem;
+  transition: background .15s;
+}
+.btn:hover { background: var(--bg-hover); }
+.btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn-primary:hover { background: var(--accent-dim); }
+
+/* ── Date navigator ── */
+.date-nav {
+  display: flex; align-items: center; gap: 4px; padding: 10px 16px;
+  background: var(--bg-card); border-bottom: 1px solid var(--border); overflow-x: auto;
+}
+.date-nav button {
+  flex-shrink: 0; padding: 5px 12px; border-radius: 20px; border: 1px solid var(--border);
+  background: transparent; color: var(--text-secondary); cursor: pointer; font-size: 0.78rem;
+  white-space: nowrap;
+}
+.date-nav button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.date-nav button:hover:not(.active) { background: var(--bg-hover); color: var(--text); }
+.date-nav .date-label { font-size: 0.75rem; color: var(--text-secondary); margin-left: 2px; }
+
+/* ── Main layout ── */
+.main { display: flex; height: calc(100vh - 97px); }
+
+/* ── Left: Event stats summary ── */
+.stats-panel {
+  width: 240px; flex-shrink: 0; background: var(--bg-card); padding: 16px;
+  border-right: 1px solid var(--border); overflow-y: auto;
+}
+.stats-panel h3 { font-size: 0.9rem; margin-bottom: 12px; color: var(--text-secondary); }
+.stat-item {
+  display: flex; justify-content: space-between; padding: 6px 0;
+  border-bottom: 1px solid var(--border); font-size: 0.82rem;
+}
+.stat-item .val { font-weight: 600; }
+.stat-item .val.warn { color: var(--warning); }
+.stat-item .val.crit { color: var(--danger); }
+
+.event-type-filter { margin-top: 12px; }
+.event-type-filter label {
+  display: flex; align-items: center; gap: 6px; padding: 4px 0;
+  font-size: 0.78rem; cursor: pointer; color: var(--text-secondary);
+}
+.event-type-filter input { accent-color: var(--accent); }
+
+/* ── Center: Event timeline ── */
+.timeline { flex: 1; overflow-y: auto; padding: 12px 16px; }
+.timeline h3 { font-size: 0.88rem; color: var(--text-secondary); margin-bottom: 10px; }
+
+.event-card {
+  display: flex; align-items: center; gap: 12px; padding: 10px 14px;
+  margin-bottom: 8px; background: var(--bg-card); border-radius: var(--radius);
+  border-left: 3px solid var(--border); cursor: pointer; transition: background .15s;
+}
+.event-card:hover { background: var(--bg-hover); }
+.event-card.emergency_brake { border-left-color: var(--danger); }
+.event-card.harsh_brake { border-left-color: #f97316; }
+.event-card.hard_acceleration { border-left-color: var(--warning); }
+.event-card.sharp_turn { border-left-color: #eab308; }
+.event-card.speeding { border-left-color: var(--danger); }
+.event-card.sentry { border-left-color: #8b5cf6; }
+.event-card.saved { border-left-color: var(--success); }
+
+.event-icon {
+  width: 36px; height: 36px; border-radius: 50%; display: flex;
+  align-items: center; justify-content: center; font-size: 1.1rem; flex-shrink: 0;
+  background: #1e293b;
+}
+.event-icon.sentry { background: #312e81; }
+.event-icon.saved { background: #14532d; }
+.event-icon.harsh_brake, .event-icon.emergency_brake { background: #450a0a; }
+.event-icon.hard_acceleration { background: #451a03; }
+.event-icon.sharp_turn { background: #422006; }
+.event-icon.speeding { background: #450a0a; }
+
+.event-info { flex: 1; min-width: 0; }
+.event-info .time { font-size: 0.8rem; font-weight: 600; }
+.event-info .type { font-size: 0.78rem; color: var(--text-secondary); text-transform: capitalize; }
+.event-info .desc { font-size: 0.75rem; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.event-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.event-actions .btn { font-size: 0.72rem; padding: 4px 10px; }
+
+/* ── Right: Video panel ── */
+.video-panel {
+  width: 360px; flex-shrink: 0; background: var(--bg-card);
+  border-left: 1px solid var(--border); display: flex; flex-direction: column;
+}
+.panel-tabs { display: flex; border-bottom: 1px solid var(--border); }
+.panel-tabs button {
+  flex: 1; padding: 10px; background: transparent; border: none;
+  color: var(--text-secondary); cursor: pointer; font-size: 0.78rem; font-weight: 500;
+}
+.panel-tabs button.active { color: var(--accent); border-bottom: 2px solid var(--accent); }
+.panel-content { flex: 1; overflow-y: auto; padding: 10px; }
+
+/* ── Empty state ── */
+.empty-state {
+  text-align: center; padding: 60px 20px; color: var(--text-secondary);
+}
+.empty-state .icon { font-size: 3rem; margin-bottom: 12px; }
+.empty-state p { font-size: 0.85rem; margin-bottom: 6px; }
+.empty-state small { font-size: 0.75rem; opacity: 0.7; }
+
+/* ── Indexer banner ── */
+.indexer-banner {
+  display: none; padding: 6px 16px; background: #1e293b;
+  border-bottom: 1px solid var(--accent); font-size: 0.75rem; color: var(--accent);
+}
+.indexer-banner.show { display: flex; align-items: center; gap: 8px; }
+.indexer-banner .spinner {
+  width: 12px; height: 12px; border: 2px solid var(--accent);
+  border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── Responsive ── */
+@media (max-width: 768px) {
+  .stats-panel { display: none; }
+  .video-panel { width: 100%; position: fixed; bottom: 0; height: 40vh; }
+  .timeline { padding-bottom: 42vh; }
+}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <h1>📹 TeslaUSB — Events</h1>
+  <div class="actions">
+    <button class="btn" onclick="location.reload()">🔄 Refresh</button>
+    <button class="btn btn-primary">📡 Scan for New Clips</button>
+  </div>
+</div>
+
+<!-- Indexer status banner -->
+<div class="indexer-banner" id="indexerBanner">
+  <div class="spinner"></div>
+  <span id="indexerText">Indexing 3 files remaining…</span>
+</div>
+
+<!-- Date navigator -->
+<div class="date-nav" id="dateNav">
+  <button onclick="prevDay()">◀</button>
+  <button class="active" data-date="2026-05-22">
+    5月22日<div class="date-label">8 events</div>
+  </button>
+  <button data-date="2026-05-21">
+    5月21日<div class="date-label">3 events</div>
+  </button>
+  <button data-date="2026-05-20">
+    5月20日<div class="date-label">12 events</div>
+  </button>
+  <button data-date="2026-05-19">
+    5月19日<div class="date-label">5 events</div>
+  </button>
+  <button onclick="nextDay()">▶</button>
+</div>
+
+<div class="main">
+
+  <!-- Left: Daily stats summary -->
+  <div class="stats-panel">
+    <h3>📊 5月22日 Summary</h3>
+    <div class="stat-item">
+      <span>Total Events</span><span class="val">8</span>
+    </div>
+    <div class="stat-item">
+      <span>Sentry Events</span><span class="val">4</span>
+    </div>
+    <div class="stat-item">
+      <span>Driving Events</span><span class="val warn">3</span>
+    </div>
+    <div class="stat-item">
+      <span>Saved Clips</span><span class="val">1</span>
+    </div>
+    <div class="stat-item">
+      <span>Avg Speed</span><span class="val">34 mph</span>
+    </div>
+    <div class="stat-item">
+      <span>Max Speed</span><span class="val crit">82 mph</span>
+    </div>
+
+    <div class="event-type-filter">
+      <h3 style="margin-top:12px">🔍 Filter</h3>
+      <label><input type="checkbox" checked> 🟣 Sentry</label>
+      <label><input type="checkbox" checked> 🔴 Emergency Brake</label>
+      <label><input type="checkbox" checked> 🟠 Harsh Brake</label>
+      <label><input type="checkbox" checked> 🟡 Hard Acceleration</label>
+      <label><input type="checkbox" checked> 🔵 Sharp Turn</label>
+      <label><input type="checkbox" checked> ⚡ Speeding</label>
+      <label><input type="checkbox" checked> 🟢 Saved</label>
+    </div>
+  </div>
+
+  <!-- Center: Event timeline -->
+  <div class="timeline" id="timeline">
+    <h3>Events — 2026年5月22日</h3>
+
+    <!-- Emergency Brake -->
+    <div class="event-card emergency_brake" onclick="playEvent('2026-05-22_08-15-32', 'front.mp4', 0)">
+      <div class="event-icon emergency_brake">🛑</div>
+      <div class="event-info">
+        <div class="time">08:15:32</div>
+        <div class="type">Emergency Brake</div>
+        <div class="desc">Emergency braking at -8.3 m/s² · location from telemetry</div>
+      </div>
+      <div class="event-actions">
+        <button class="btn btn-primary">▶ Play</button>
+        <button class="btn">⬇ ZIP</button>
+      </div>
+    </div>
+
+    <!-- Sentry -->
+    <div class="event-card sentry" onclick="playEvent('2026-05-22_07-40-06', 'front.mp4', 0)">
+      <div class="event-icon sentry">👁️</div>
+      <div class="event-info">
+        <div class="time">07:40:06</div>
+        <div class="type">Sentry Mode</div>
+        <div class="desc">Impact detected · location from event.json (31.2304, 121.4737)</div>
+      </div>
+      <div class="event-actions">
+        <button class="btn btn-primary">▶ Play</button>
+        <button class="btn">⬇ ZIP</button>
+      </div>
+    </div>
+
+    <!-- Hard Acceleration -->
+    <div class="event-card hard_acceleration" onclick="playEvent('2026-05-22_07-35-18', 'front.mp4', 0)">
+      <div class="event-icon hard_acceleration">🚀</div>
+      <div class="event-info">
+        <div class="time">07:35:18</div>
+        <div class="type">Hard Acceleration</div>
+        <div class="desc">Accelerating at 4.2 m/s² · location from telemetry</div>
+      </div>
+      <div class="event-actions">
+        <button class="btn btn-primary">▶ Play</button>
+        <button class="btn">⬇ ZIP</button>
+      </div>
+    </div>
+
+    <!-- Sentry -->
+    <div class="event-card sentry" onclick="playEvent('2026-05-22_05-22-45', 'front.mp4', 0)">
+      <div class="event-icon sentry">👁️</div>
+      <div class="event-info">
+        <div class="time">05:22:45</div>
+        <div class="type">Sentry Mode</div>
+        <div class="desc">Tilt detected · location from event.json (31.2310, 121.4732)</div>
+      </div>
+      <div class="event-actions">
+        <button class="btn btn-primary">▶ Play</button>
+        <button class="btn">⬇ ZIP</button>
+      </div>
+    </div>
+
+    <!-- Sharp Turn -->
+    <div class="event-card sharp_turn" onclick="playEvent('2026-05-22_05-20_12', 'front.mp4', 0)">
+      <div class="event-icon sharp_turn">🔄</div>
+      <div class="event-info">
+        <div class="time">05:20:12</div>
+        <div class="type">Sharp Turn</div>
+        <div class="desc">Lateral G-force 4.8 m/s² · location from telemetry</div>
+      </div>
+      <div class="event-actions">
+        <button class="btn btn-primary">▶ Play</button>
+        <button class="btn">⬇ ZIP</button>
+      </div>
+    </div>
+
+    <!-- Sentry -->
+    <div class="event-card sentry" onclick="playEvent('2026-05-22_02-15-33', 'front.mp4', 0)">
+      <div class="event-icon sentry">👁️</div>
+      <div class="event-info">
+        <div class="time">02:15:33</div>
+        <div class="type">Sentry Mode</div>
+        <div class="desc">Impact detected · location from event.json (31.2309, 121.4740)</div>
+      </div>
+      <div class="event-actions">
+        <button class="btn btn-primary">▶ Play</button>
+        <button class="btn">⬇ ZIP</button>
+      </div>
+    </div>
+
+    <!-- Speeding -->
+    <div class="event-card speeding" onclick="playEvent('2026-05-22_00-48-55', 'front.mp4', 0)">
+      <div class="event-icon speeding">⚡</div>
+      <div class="event-info">
+        <div class="time">00:48:55</div>
+        <div class="type">Speeding</div>
+        <div class="desc">Speed 85 mph · location from telemetry</div>
+      </div>
+      <div class="event-actions">
+        <button class="btn btn-primary">▶ Play</button>
+        <button class="btn">⬇ ZIP</button>
+      </div>
+    </div>
+
+    <!-- Saved -->
+    <div class="event-card saved" onclick="playEvent('2026-05-22_00-30-00', 'front.mp4', 0)">
+      <div class="event-icon saved">💾</div>
+      <div class="event-info">
+        <div class="time">00:30:00</div>
+        <div class="type">Saved Clip</div>
+        <div class="desc">Manual save · location from event.json (31.2315, 121.4725)</div>
+      </div>
+      <div class="event-actions">
+        <button class="btn btn-primary">▶ Play</button>
+        <button class="btn">⬇ ZIP</button>
+      </div>
+    </div>
+
+    <!-- Empty state (shown when no events) -->
+    <!--
+    <div class="empty-state">
+      <div class="icon">📭</div>
+      <p>No events found for this date.</p>
+      <small>Events are detected from dashcam telemetry — speed, brake, steering, and Autopilot data —
+      or inferred from Tesla's event.json for Sentry and Saved recordings.</small>
+    </div>
+    -->
+  </div>
+
+  <!-- Right: Video browser panel -->
+  <div class="video-panel" id="videoPanel">
+    <div class="panel-tabs">
+      <button class="active" data-tab="events">Events</button>
+      <button data-tab="clips">All Clips</button>
+    </div>
+    <div class="panel-content">
+      <!-- Simplified clip cards (would be dynamically loaded) -->
+      <div style="font-size:0.8rem; color:var(--text-secondary); padding:8px">
+        Click an event ▶ button to open the video player with telemetry HUD overlay.
+      </div>
+
+      <div style="margin-top:12px; padding:8px; background:var(--bg); border-radius:var(--radius); font-size:0.75rem;">
+        <strong>Video Player Overlay (opens on Play)</strong><br>
+        <span style="color:var(--text-secondary)">
+        • Speed, gear, steering wheel, brake/throttle HUD<br>
+        • Camera angle switching (Front/Back/Left/Right)<br>
+        • Frame-accurate event seeking<br>
+        • Download ZIP of all camera angles
+        </span>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// Demo interactivity
+function playEvent(folder, file, frame) {
+  alert(`[Demo] Opening video player overlay for:\n${folder}/${file}\nFrame offset: ${frame}\n\nIn production: telemetry HUD shows speed, gear, steering, brake, throttle, blinkers, and Autopilot status.`);
+}
+
+function prevDay() { alert('[Demo] Navigate to previous day with events'); }
+function nextDay() { alert('[Demo] Navigate to next day with events'); }
+
+// Tab switching
+document.querySelectorAll('.panel-tabs button').forEach(btn => {
+  btn.addEventListener('click', function() {
+    document.querySelectorAll('.panel-tabs button').forEach(b => b.classList.remove('active'));
+    this.classList.add('active');
+  });
+});
+
+// Date pill clicks
+document.querySelectorAll('.date-nav button[data-date]').forEach(btn => {
+  btn.addEventListener('click', function() {
+    document.querySelectorAll('.date-nav button[data-date]').forEach(b => b.classList.remove('active'));
+    this.classList.add('active');
+  });
+});
+</script>
+
+</body>
+</html>

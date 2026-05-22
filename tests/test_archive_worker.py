@@ -919,8 +919,8 @@ class TestClipHasGpsSignal:
     def fake_msg(self):
         from types import SimpleNamespace
 
-        def _make(has_gps: bool):
-            return SimpleNamespace(has_gps=has_gps)
+        def _make(has_movement: bool):
+            return SimpleNamespace(has_movement=has_movement)
 
         return _make
 

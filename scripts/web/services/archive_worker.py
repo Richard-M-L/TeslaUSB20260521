@@ -1297,10 +1297,10 @@ def _write_inline_sei_sidecar(dest_path: str) -> None:
         )
     else:
         logger.info(
-            "inline-sei: parsed %d messages (%d GPS, %d no-GPS), "
+            "inline-sei: parsed %d messages (%d moving, %d stationary), "
             "mvhd=%s, elapsed=%.2fs for %s",
             sidecar.sei_count, len(sidecar.messages),
-            sidecar.no_gps_count, mvhd_repr, elapsed,
+            sidecar.no_movement_count, mvhd_repr, elapsed,
             os.path.basename(dest_path),
         )
 
@@ -1786,7 +1786,7 @@ _PEEK_GIVE_UP_AGE_SECONDS = 300.0
 
 
 def _clip_has_gps_signal(source_path: str) -> Optional[bool]:
-    """Return whether a RecentClips candidate has any GPS-bearing SEI.
+    """Return whether a RecentClips candidate has any movement-bearing SEI.
 
     Issue #167 sub-deliverable 2 — fast SEI peek used by
     :func:`process_one_claim` to decide whether to skip a stationary
@@ -1799,7 +1799,7 @@ def _clip_has_gps_signal(source_path: str) -> Optional[bool]:
       * ``True``  — at least one SEI message with non-zero lat/lon was
         found in the first ``_SKIP_GPS_PEEK_MAX_MESSAGES`` samples.
         The clip is "moving"; the worker should copy it.
-      * ``False`` — every sampled SEI message had ``has_gps == False``,
+      * ``False`` — every sampled SEI message had ``has_movement == False``,
         or the file has no SEI messages at all (e.g., a non-camera
         recording), or the file has fewer than the cap. The clip is
         "stationary"; the worker can mark it ``skipped_stationary``.
@@ -1838,7 +1838,7 @@ def _clip_has_gps_signal(source_path: str) -> Optional[bool]:
                 sample_rate=_SKIP_GPS_PEEK_SAMPLE_RATE,
                 max_walk_bytes=_SKIP_GPS_PEEK_MAX_WALK_BYTES):
             scanned += 1
-            if msg.has_gps:
+            if msg.has_movement:
                 return True
             if scanned >= _SKIP_GPS_PEEK_MAX_MESSAGES:
                 break

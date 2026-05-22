@@ -864,7 +864,7 @@ class TestSeiSidecar:
         )
         assert wrote is not None, "write_sei_sidecar returned None"
         assert wrote.sei_count == 5
-        assert wrote.no_gps_count == 0
+        assert wrote.no_movement_count == 0
         assert len(wrote.messages) == 5
 
         loaded = sei_parser.read_sei_sidecar(str(mp4))
@@ -872,7 +872,7 @@ class TestSeiSidecar:
         assert loaded.schema_version == sei_parser.SIDECAR_SCHEMA_VERSION
         assert loaded.sample_rate == 1
         assert loaded.sei_count == 5
-        assert loaded.no_gps_count == 0
+        assert loaded.no_movement_count == 0
         assert len(loaded.messages) == 5
         for orig, got in zip(wrote.messages, loaded.messages):
             assert abs(orig.latitude_deg - got.latitude_deg) < 1e-6

@@ -204,15 +204,10 @@
     <!-- Driving Statistics & Event Analytics (from geo-index) -->
     {% if map_available %}
     <div class="analytics-section" id="drivingStatsSection">
-        <h3>🗺️ Driving Statistics</h3>
-        <p class="section-description">GPS and telemetry data extracted from dashcam videos. <a href="{{ url_for('mapping.map_view') }}">Open Map →</a></p>
+        <h3>📊 Driving Statistics</h3>
+        <p class="section-description">Telemetry data extracted from dashcam videos — speed, autopilot state, and detected driving events.</p>
         <div id="drivingStatsContent">
             <div class="analytics-grid" id="drivingStatsGrid" style="display:none">
-                <div class="analytics-card">
-                    <div class="stat-row"><span class="stat-label">Total Distance</span><span class="stat-value" id="dsTotalDist">—</span></div>
-                    <div class="stat-row"><span class="stat-label">Total Drive Time</span><span class="stat-value" id="dsTotalTime">—</span></div>
-                    <div class="stat-row"><span class="stat-label">Total Trips</span><span class="stat-value" id="dsTripCount">—</span></div>
-                </div>
                 <div class="analytics-card">
                     <div class="stat-row"><span class="stat-label">Avg Speed</span><span class="stat-value" id="dsAvgSpeed">—</span></div>
                     <div class="stat-row"><span class="stat-label">Max Speed</span><span class="stat-value" id="dsMaxSpeed">—</span></div>
@@ -221,11 +216,10 @@
                 <div class="analytics-card">
                     <div class="stat-row"><span class="stat-label">Total Events</span><span class="stat-value" id="dsEventCount">—</span></div>
                     <div class="stat-row"><span class="stat-label">Warnings/Critical</span><span class="stat-value" id="dsWarnCount">—</span></div>
-                    <div class="stat-row"><span class="stat-label">Events per 100 km</span><span class="stat-value" id="dsEvPer100">—</span></div>
                 </div>
             </div>
             <div id="drivingStatsEmpty" style="text-align:center;padding:20px;color:var(--text-muted,#888);">
-                No driving data indexed yet. <a href="{{ url_for('mapping.map_view') }}">Go to Map</a> and click "Index Videos" to get started.
+                No driving data indexed yet. Videos must be indexed before statistics appear.
             </div>
         </div>
     </div>
@@ -275,15 +269,11 @@ async function loadDrivingStats() {
         document.getElementById('drivingStatsGrid').style.display = '';
         document.getElementById('drivingStatsEmpty').style.display = 'none';
 
-        document.getElementById('dsTotalDist').textContent = `${data.total_distance_mi} mi (${data.total_distance_km} km)`;
-        document.getElementById('dsTotalTime').textContent = `${data.total_duration_hours} hrs`;
-        document.getElementById('dsTripCount').textContent = data.trip_count;
         document.getElementById('dsAvgSpeed').textContent = `${data.avg_speed_mph} mph`;
         document.getElementById('dsMaxSpeed').textContent = `${data.max_speed_mph} mph`;
         document.getElementById('dsFsdPct').textContent = `${data.fsd_usage_pct}%`;
         document.getElementById('dsEventCount').textContent = data.total_events;
         document.getElementById('dsWarnCount').textContent = data.warning_events;
-        document.getElementById('dsEvPer100').textContent = data.events_per_100km;
     } catch(e) { console.error('Failed to load driving stats:', e); }
 }
 

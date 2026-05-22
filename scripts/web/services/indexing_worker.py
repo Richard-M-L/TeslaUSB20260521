@@ -353,7 +353,7 @@ def process_claimed_item(
 
     if outcome in (
         IO.INDEXED, IO.ALREADY_INDEXED, IO.DUPLICATE_UPGRADED,
-        IO.NO_GPS_RECORDED, IO.NOT_FRONT_CAMERA,
+        IO.NO_MOVEMENT_RECORDED, IO.NOT_FRONT_CAMERA,
     ):
         return WorkerAction(action='complete', outcome=outcome)
 

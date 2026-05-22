@@ -144,13 +144,13 @@ class TestReclaimStationary:
             db_path=db, archive_root=archive_root, min_age_hours=1,
         )
         assert result['deleted_count'] == 0
-        assert result['kept_has_gps'] == 1
+        assert result['kept_has_waypoints'] == 1
         assert os.path.isfile(path)
 
     def test_recent_clip_with_events_is_kept_in_event_only_bucket(
             self, db, archive_root):
         """Stationary clip with events lands in `kept_has_event_only`,
-        not the `kept_has_gps` bucket. The bucket distinction matters
+        not the `kept_has_waypoints` bucket. The bucket distinction matters
         to operators reading the JSON: a Sentry-mode-while-parked
         event is NOT GPS data.
         """
@@ -163,7 +163,7 @@ class TestReclaimStationary:
         )
         assert result['deleted_count'] == 0
         assert result['kept_has_event_only'] == 1
-        assert result['kept_has_gps'] == 0
+        assert result['kept_has_waypoints'] == 0
         assert os.path.isfile(path)
 
     def test_unindexed_recent_clip_is_kept(self, db, archive_root):
@@ -299,7 +299,7 @@ class TestReclaimStationary:
         for field in (
             'deleted_count', 'freed_bytes', 'scanned',
             'kept_too_new', 'kept_has_event_counterpart',
-            'kept_unindexed', 'kept_has_gps', 'kept_has_event_only',
+            'kept_unindexed', 'kept_has_waypoints', 'kept_has_event_only',
             'min_age_hours', 'duration_seconds',
         ):
             assert field in result, f"missing summary field: {field}"

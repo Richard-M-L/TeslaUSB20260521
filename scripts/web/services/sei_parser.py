@@ -138,6 +138,24 @@ class SeiMessage:
         return (self.latitude_deg != 0.0 or self.longitude_deg != 0.0)
 
     @property
+    def has_movement(self) -> bool:
+        """Check if this message indicates the vehicle is moving/driving.
+
+        Uses telemetry signals so it works in regions where Tesla does not
+        record GPS coordinates in dashcam video SEI metadata (e.g. China).
+        Primary indicators: speed above parking creep, drive gear engaged,
+        or Autopilot active (FSD/TACC/Autosteer all imply the vehicle is
+        in motion).
+        """
+        if self.vehicle_speed_mps > 0.5:
+            return True
+        if self.gear_state in ('DRIVE', 'REVERSE'):
+            return True
+        if self.autopilot_state != 'NONE':
+            return True
+        return False
+
+    @property
     def speed_mph(self) -> float:
         """Speed in miles per hour."""
         return abs(self.vehicle_speed_mps) * 2.23694
@@ -671,9 +689,9 @@ def parse_video_sei(
 # version is bumped any time field semantics change in a way the old
 # reader can't safely interpret.
 #
-# Only GPS-bearing messages are stored (the indexer drops no-GPS
+# Only movement-bearing messages are stored (the indexer drops stationary
 # messages anyway). For diagnostic visibility we ALSO store
-# ``sei_count`` (total messages walked) and ``no_gps_count`` (how many
+# ``sei_count`` (total messages walked) and ``no_movement_count`` (how many
 # were dropped) so the indexer's per-clip log lines are unchanged.
 #
 # Sample-rate is recorded explicitly so a reader that wants a finer
@@ -682,15 +700,15 @@ def parse_video_sei(
 # (``sample_rate=30``) — finer-grained tools (the diagnostic
 # ``sample_rate=1`` walk) fall back transparently.
 SIDECAR_SUFFIX = '.sei.json'
-SIDECAR_SCHEMA_VERSION = 1
+SIDECAR_SCHEMA_VERSION = 2
 
 
 @dataclass
 class SeiSidecar:
     """Cached SEI parse result loaded from a sidecar JSON.
 
-    ``messages`` contains only GPS-bearing messages (the same filter
-    the indexer applies inline). ``sei_count`` and ``no_gps_count``
+    ``messages`` contains only movement-bearing messages (the same filter
+    the indexer applies inline). ``sei_count`` and ``no_movement_count``
     preserve diagnostic visibility for the stationary-clip case.
 
     ``mvhd_creation_time_utc`` is the timezone-aware UTC datetime
@@ -707,7 +725,7 @@ class SeiSidecar:
     schema_version: int
     sample_rate: int
     sei_count: int
-    no_gps_count: int
+    no_movement_count: int
     mvhd_creation_time_utc: Optional[datetime]
     messages: List[SeiMessage]
     video_size_bytes: int
@@ -834,16 +852,16 @@ def write_sei_sidecar(
         mvhd_dt = None
 
     sei_count = 0
-    no_gps_count = 0
-    gps_messages: List[SeiMessage] = []
+    no_movement_count = 0
+    movement_messages: List[SeiMessage] = []
     try:
         for msg in extract_sei_messages(
                 video_path, sample_rate=sample_rate):
             sei_count += 1
-            if not msg.has_gps:
-                no_gps_count += 1
+            if not msg.has_movement:
+                no_movement_count += 1
                 continue
-            gps_messages.append(msg)
+            movement_messages.append(msg)
     except (FileNotFoundError, ValueError) as e:
         logger.debug(
             "sei sidecar: SEI walk failed for %s: %s", video_path, e,
@@ -861,13 +879,13 @@ def write_sei_sidecar(
         'schema_version': SIDECAR_SCHEMA_VERSION,
         'sample_rate': sample_rate,
         'sei_count': sei_count,
-        'no_gps_count': no_gps_count,
+        'no_movement_count': no_movement_count,
         'mvhd_creation_time_utc': (
             mvhd_dt.isoformat() if mvhd_dt is not None else None
         ),
         'video_size_bytes': st.st_size,
         'video_mtime_unix': st.st_mtime,
-        'messages': [_message_to_dict(m) for m in gps_messages],
+        'messages': [_message_to_dict(m) for m in movement_messages],
     }
 
     tmp_path = sidecar_path + '.tmp'
@@ -913,9 +931,9 @@ def write_sei_sidecar(
         schema_version=SIDECAR_SCHEMA_VERSION,
         sample_rate=sample_rate,
         sei_count=sei_count,
-        no_gps_count=no_gps_count,
+        no_movement_count=no_movement_count,
         mvhd_creation_time_utc=mvhd_dt,
-        messages=gps_messages,
+        messages=movement_messages,
         video_size_bytes=st.st_size,
         video_mtime_unix=st.st_mtime,
     )
@@ -973,7 +991,7 @@ def read_sei_sidecar(
         schema_v = int(payload['schema_version'])
         sample_rate = int(payload['sample_rate'])
         sei_count = int(payload['sei_count'])
-        no_gps_count = int(payload['no_gps_count'])
+        no_movement_count = int(payload['no_movement_count'])
         size_bytes = int(payload['video_size_bytes'])
         mtime_unix = float(payload['video_mtime_unix'])
         msgs_payload = payload['messages']
@@ -1056,7 +1074,7 @@ def read_sei_sidecar(
         schema_version=schema_v,
         sample_rate=sample_rate,
         sei_count=sei_count,
-        no_gps_count=no_gps_count,
+        no_movement_count=no_movement_count,
         mvhd_creation_time_utc=mvhd_dt,
         messages=messages,
         video_size_bytes=size_bytes,
@@ -1089,10 +1107,10 @@ def delete_sei_sidecar(video_path: str) -> bool:
 
 
 def get_video_gps_summary(video_path: str) -> Optional[dict]:
-    """Get a quick GPS summary from a video file (first and last GPS points).
+    """Get a quick summary from a video file (first and last frames with movement).
 
     Samples only the first and last few seconds of the video for speed.
-    Returns None if no GPS data is found.
+    Returns None if no movement-bearing data is found.
 
     Args:
         video_path: Path to the MP4 file.
@@ -1100,21 +1118,22 @@ def get_video_gps_summary(video_path: str) -> Optional[dict]:
     Returns:
         Dict with 'start_lat', 'start_lon', 'end_lat', 'end_lon',
         'start_heading', 'end_heading', 'frame_count', or None.
+        GPS fields may be 0.0 in regions where Tesla does not record
+        coordinates in video SEI metadata.
     """
     try:
         messages = list(extract_sei_messages(video_path, sample_rate=30))
     except (FileNotFoundError, ValueError) as e:
-        logger.warning("Cannot get GPS summary for %s: %s", video_path, e)
+        logger.warning("Cannot get summary for %s: %s", video_path, e)
         return None
 
-    # Filter to messages with valid GPS
-    gps_messages = [m for m in messages if m.has_gps]
+    movement_messages = [m for m in messages if m.has_movement]
 
-    if not gps_messages:
+    if not movement_messages:
         return None
 
-    first = gps_messages[0]
-    last = gps_messages[-1]
+    first = movement_messages[0]
+    last = movement_messages[-1]
 
     return {
         'start_lat': first.latitude_deg,
@@ -1123,7 +1142,7 @@ def get_video_gps_summary(video_path: str) -> Optional[dict]:
         'end_lat': last.latitude_deg,
         'end_lon': last.longitude_deg,
         'end_heading': last.heading_deg,
-        'frame_count': len(gps_messages),
+        'frame_count': len(movement_messages),
         'duration_ms': last.timestamp_ms - first.timestamp_ms,
     }
 
@@ -1144,7 +1163,7 @@ if __name__ == '__main__':
 
     count = 0
     for msg in extract_sei_messages(path, sample_rate=rate):
-        if msg.has_gps:
+        if msg.has_movement:
             print(json.dumps({
                 'frame': msg.frame_index,
                 'time_ms': round(msg.timestamp_ms, 1),
@@ -1159,5 +1178,5 @@ if __name__ == '__main__':
             }))
             count += 1
 
-    print(f"\n--- Extracted {count} GPS-tagged SEI messages from {path} ---",
+    print(f"\n--- Extracted {count} movement-bearing SEI messages from {path} ---",
           file=sys.stderr)

@@ -530,7 +530,7 @@
                         Reclaim space from stationary RecentClips
                     </div>
                     <p style="font-size:0.8rem; color:var(--text-secondary); margin:0 0 10px">
-                        Deletes archived RecentClips with no GPS movement (parked Sentry-mode footage,
+                        Deletes archived RecentClips with no driving activity (parked Sentry-mode footage,
                         no driving, no events). Saved/Sentry event clips are preserved even if a
                         RecentClips copy of the same recording exists. This can free a lot of space —
                         on a typical install, RecentClips dominates the SD card.
@@ -545,9 +545,10 @@
                     </div>
                     <p style="font-size:0.8rem; color:var(--text-secondary); margin:0 0 10px">
                         The archive worker peeks at each new RecentClips file and skips
-                        copying it to the SD card if no GPS movement is detected — this
-                        keeps overnight Sentry-mode parking footage from filling the SD
-                        card. Sentry/Saved event clips are <strong>never</strong> skipped.
+                        copying it to the SD card if no driving activity is detected (using
+                        speed, gear, and Autopilot telemetry) — this keeps overnight
+                        Sentry-mode parking footage from filling the SD card.
+                        Sentry/Saved event clips are <strong>never</strong> skipped.
                     </p>
                     <div id="sr-skip-stationary-status" style="font-size:0.85rem; color:var(--text-secondary)">
                         Skipped in last 24 hours: <strong><span id="sr-skip-stationary-count">—</span></strong>
@@ -751,7 +752,7 @@
                hidden></p>
             <p style="font-size:0.8rem; color:var(--text-secondary); margin:0 0 8px">
                 Clips older than the retention window above are automatically deleted.
-                Trips, waypoints, and detected events are <strong>preserved</strong> —
+                Waypoints and detected events are <strong>preserved</strong> —
                 only the dashcam clip is removed.
             </p>
             <button type="button" class="btn btn-secondary"
@@ -764,47 +765,39 @@
     </details>
     {% endif %}
 
-    <!-- Mapping & Indexing Settings -->
+    <!-- Indexing Settings -->
     <details class="settings-section">
-        <summary>Mapping & Indexing</summary>
+        <summary>Indexing</summary>
         <div class="section-content">
             <form method="post" action="{{ url_for('mode_control.save_mapping_settings') }}">
                 <p style="font-size:0.85rem; color:var(--text-secondary); margin:0 0 16px">
-                    Tesla embeds GPS coordinates and telemetry data (speed, braking, steering) inside each dashcam video.
-                    The indexer extracts this data and builds a database of trips, routes, and driving events.
-                    This powers the map view — showing where you drove, plotting routes, and detecting events
-                    like hard braking or sharp turns.
+                    Tesla embeds telemetry data (speed, braking, steering, gear, Autopilot state)
+                    and — where available — GPS coordinates in each dashcam video. The indexer extracts
+                    this data and builds a database of waypoints and driving events. This powers
+                    event detection like hard braking, sharp turns, and speed alerts.
                 </p>
                 <div class="form-group" style="margin-bottom:14px">
                     <label style="display:flex; align-items:center; gap:8px; cursor:pointer">
                         <input type="checkbox" name="enabled" {% if cfg_mapping.enabled %}checked{% endif %}>
-                        <strong>Enable GPS indexing</strong>
+                        <strong>Enable indexing</strong>
                     </label>
                     <p style="font-size:0.8rem; color:var(--text-secondary); margin:4px 0 0 26px">
-                        Scans dashcam videos to extract GPS waypoints and build trip routes.
-                        When disabled, the map page won't show any trips or routes. Videos can still be browsed by folder.
+                        Scans dashcam videos to extract waypoints and telemetry, then detects driving
+                        events. When disabled, the events page won't show any detected events.
+                        Videos can still be browsed by folder.
                     </p>
                 </div>
                 <div class="settings-form-grid">
                     <div class="form-group">
-                        <label style="font-size:0.85rem"><strong>Trip gap (minutes)</strong></label>
-                        <input type="number" name="trip_gap_minutes" value="{{ cfg_mapping.trip_gap_minutes }}" min="1" max="60" class="settings-form-input">
-                        <p style="font-size:0.8rem; color:var(--text-secondary); margin:4px 0 0">
-                            If there's a gap longer than this between GPS waypoints, a new trip is started.
-                            Lower values split stops (gas station, drive-through) into separate trips.
-                            Higher values keep them as one continuous trip.
-                        </p>
-                    </div>
-                    <div class="form-group">
                         <label style="font-size:0.85rem"><strong>Speed alert (mph)</strong></label>
                         <input type="number" name="speed_limit_mph" value="{{ cfg_mapping.speed_limit_mph|int }}" min="0" max="200" step="5" class="settings-form-input">
                         <p style="font-size:0.8rem; color:var(--text-secondary); margin:4px 0 0">
-                            Marks a driving event on the map when your speed exceeds this threshold.
+                            Detects a speeding event when your speed exceeds this threshold.
                             Set to 0 to disable speed alerts entirely.
                         </p>
                     </div>
                 </div>
-                <button type="submit" class="btn btn-primary" style="width:100%">Save Mapping Settings</button>
+                <button type="submit" class="btn btn-primary" style="width:100%">Save Indexing Settings</button>
             </form>
         </div>
     </details>
@@ -1957,7 +1950,7 @@ if (document.getElementById('fsck-status-container')) {
         var btn = $('sr-reclaim-stationary-btn');
         if (!btn) return;
         var ok = window.confirm(
-            'Delete all archived RecentClips with no GPS movement?\n\n' +
+            'Delete all archived RecentClips with no driving activity?\n\n' +
             'This deletes parked-Sentry / stationary footage from the SD card. ' +
             'Saved/Sentry event clips are preserved. Indexed driving footage is preserved. ' +
             'This may free several GB.'

@@ -62,23 +62,8 @@ CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER PRIMARY KEY
 );
 
-CREATE TABLE IF NOT EXISTS trips (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    start_time TEXT NOT NULL,
-    end_time TEXT,
-    start_lat REAL,
-    start_lon REAL,
-    end_lat REAL,
-    end_lon REAL,
-    distance_km REAL DEFAULT 0.0,
-    duration_seconds INTEGER DEFAULT 0,
-    source_folder TEXT,
-    indexed_at TEXT
-);
-
 CREATE TABLE IF NOT EXISTS waypoints (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    trip_id INTEGER REFERENCES trips(id) ON DELETE CASCADE,
     timestamp TEXT NOT NULL,
     lat REAL NOT NULL,
     lon REAL NOT NULL,
@@ -94,8 +79,8 @@ CREATE TABLE IF NOT EXISTS waypoints (
 -- speed/heading/autopilot_state — the columns the polyline render
 -- and click-to-seek lookups need on every map tile. ``waypoints_cold``
 -- carries steering/brake/accel/gear/blinker — used by the in-clip
--- HUD scrubber, lazy-fetched per-trip via
--- ``GET /api/trip/<id>/telemetry`` only when the user opens the
+-- HUD scrubber, lazy-fetched via
+-- ``POST /api/waypoints/telemetry`` only when the user opens the
 -- video overlay. Splitting the data physically (not just at SELECT
 -- time) is what gives the SD-page-cache benefit: cold pages stay
 -- evicted during normal map browsing.
@@ -120,7 +105,6 @@ CREATE TABLE IF NOT EXISTS waypoints_cold (
 
 CREATE TABLE IF NOT EXISTS detected_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    trip_id INTEGER REFERENCES trips(id) ON DELETE CASCADE,
     timestamp TEXT NOT NULL,
     lat REAL,
     lon REAL,
@@ -163,35 +147,12 @@ CREATE TABLE IF NOT EXISTS indexing_queue (
     source TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_waypoints_trip ON waypoints(trip_id);
 CREATE INDEX IF NOT EXISTS idx_waypoints_coords ON waypoints(lat, lon);
 CREATE INDEX IF NOT EXISTS idx_waypoints_timestamp ON waypoints(timestamp);
 CREATE INDEX IF NOT EXISTS idx_waypoints_video_path ON waypoints(video_path);
--- Covering index for query_trips' video_count subquery: lets SQLite count
--- DISTINCT video_path per trip without touching the main waypoints table.
--- Without this, /api/trips fans out to 1 + 2N queries (where N = page size)
--- and visibly stalls the map page on databases with thousands of waypoints.
-CREATE INDEX IF NOT EXISTS idx_waypoints_trip_video
-    ON waypoints(trip_id, video_path);
--- Day-based aggregate (/api/days) and per-day route lookup
--- (/api/day/<date>/routes) both filter by substr(start_time,1,10).
--- v7: ``idx_trips_start_time`` keeps a sortable-text scan available
--- for callers that filter by ``start_time >= ?`` (e.g. /api/trips with
--- date_from/date_to).
-CREATE INDEX IF NOT EXISTS idx_trips_start_time ON trips(start_time);
-CREATE INDEX IF NOT EXISTS idx_events_trip ON detected_events(trip_id);
 CREATE INDEX IF NOT EXISTS idx_events_coords ON detected_events(lat, lon);
 CREATE INDEX IF NOT EXISTS idx_events_type ON detected_events(event_type);
 CREATE INDEX IF NOT EXISTS idx_events_timestamp ON detected_events(timestamp);
--- v8: expression indexes on substr(<ts>, 1, 10) for the day-based
--- queries (/api/days, /api/day/<date>/routes, /api/events?date=).
--- Plain idx_trips_start_time / idx_events_timestamp are NOT used by
--- SQLite when the WHERE clause wraps the column in substr() — verified
--- via EXPLAIN QUERY PLAN. Without these expression indexes the day
--- view degrades to a full table scan on every nav, which is unusable
--- on a Pi Zero 2 W with a few thousand trips.
-CREATE INDEX IF NOT EXISTS idx_trips_day
-    ON trips(substr(start_time, 1, 10));
 CREATE INDEX IF NOT EXISTS idx_events_day
     ON detected_events(substr(timestamp, 1, 10));
 -- Worker pick-next index: partial index over only unclaimed, ready-to-run
@@ -490,20 +451,6 @@ def _init_db(db_path: str) -> sqlite3.Connection:
                     conn.execute(f"ALTER TABLE waypoints ADD COLUMN {col} INTEGER DEFAULT 0")
                 except sqlite3.OperationalError:
                     pass  # Column already exists
-        if current > 0 and current < 3:
-            # v3: clean up duplicate trips/waypoints from earlier indexer bugs.
-            # Wrapped in a savepoint so a failure during migration doesn't leave
-            # the schema_version bumped without the data fixes applied.
-            try:
-                conn.execute("SAVEPOINT migrate_v3")
-                _migrate_v2_to_v3(conn)
-                conn.execute("RELEASE SAVEPOINT migrate_v3")
-            except Exception as e:
-                conn.execute("ROLLBACK TO SAVEPOINT migrate_v3")
-                conn.execute("RELEASE SAVEPOINT migrate_v3")
-                logger.error("Migration v2->v3 failed, leaving schema at v2: %s", e)
-                conn.commit()
-                return conn  # Skip schema_version bump so it retries next startup
         if current > 0 and current < 4:
             # v4: re-evaluate Sentry/Saved clips with Tesla's event.json
             # (which has accurate GPS) instead of the prior nearest-waypoint
@@ -740,187 +687,6 @@ def _init_db(db_path: str) -> sqlite3.Connection:
     return conn
 
 
-# ---------------------------------------------------------------------------
-# Migrations
-# ---------------------------------------------------------------------------
-
-def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
-    """Clean up duplicate trips and waypoints from earlier indexer bugs.
-
-    Earlier versions of the indexer:
-      * Created separate trips for the same physical drive when the videos
-        were ingested from different source folders (RecentClips vs ArchivedClips).
-      * Stored duplicate waypoints with the same ``(timestamp, lat, lon)`` but
-        different ``video_path`` strings (one per copy of the video).
-      * Recorded ``source_folder='..'`` for ArchivedClips because of a path
-        normalization bug.
-
-    This one-time migration:
-      1. Repairs ``source_folder='..'`` rows by inferring from waypoint paths.
-      2. Merges trips whose time windows overlap or are within
-         ``_TRIP_GAP_MINUTES_DEFAULT`` minutes of each other (regardless of
-         source_folder).
-      3. Dedupes waypoints within each trip by ``(timestamp, lat, lon)``,
-         preferring the row whose ``video_path`` references ArchivedClips
-         (most durable storage).
-      4. Recomputes ``start_time``, ``end_time``, start/end coords,
-         ``distance_km`` and ``duration_seconds`` for every trip; deletes
-         trips left with no waypoints.
-    """
-    # Phase 3c.2 (#100): the trip-gap default and merge helper stay in
-    # ``mapping_service`` because they're runtime hot-path dependencies
-    # of ``_index_video``. Lazy import inside the migration body keeps
-    # the dependency one-way at module load time.
-    from services.mapping_service import (
-        _TRIP_GAP_MINUTES_DEFAULT,
-        _merge_all_adjacent_trip_pairs,
-        _haversine_km,
-    )
-    gap_seconds = _TRIP_GAP_MINUTES_DEFAULT * 60
-    log_parts: List[str] = []
-
-    # --- Phase 1: source_folder='..' ---
-    bad = conn.execute(
-        "SELECT id FROM trips WHERE source_folder = '..' OR source_folder LIKE '..%'"
-    ).fetchall()
-    fixed_src = 0
-    for r in bad:
-        wp = conn.execute(
-            "SELECT video_path FROM waypoints "
-            "WHERE trip_id = ? AND video_path IS NOT NULL ORDER BY id LIMIT 1",
-            (r['id'],),
-        ).fetchone()
-        if wp and wp['video_path']:
-            vp = wp['video_path'].replace('\\', '/')
-            if 'ArchivedClips' in vp:
-                folder = 'ArchivedClips'
-            elif '/' in vp:
-                folder = vp.split('/')[0]
-            else:
-                folder = 'Unknown'
-            conn.execute(
-                "UPDATE trips SET source_folder = ? WHERE id = ?",
-                (folder, r['id']),
-            )
-            fixed_src += 1
-    log_parts.append(f"fixed {fixed_src} '..' source_folder rows")
-
-    # --- Phase 2: merge overlapping/close trips ---
-    # Repeatedly find any pair of trips whose windows are within gap_seconds
-    # of each other (in either direction) and merge the higher-id into the lower.
-    merged = _merge_all_adjacent_trip_pairs(conn, gap_seconds)
-    log_parts.append(f"merged {merged} overlapping trip pairs")
-
-    # --- Phase 3: dedupe waypoints within a trip ---
-    dups = conn.execute(
-        """SELECT trip_id, timestamp, lat, lon, COUNT(*) AS cnt
-           FROM waypoints
-           WHERE trip_id IS NOT NULL
-           GROUP BY trip_id, timestamp, lat, lon
-           HAVING COUNT(*) > 1"""
-    ).fetchall()
-    deduped = 0
-    for d in dups:
-        ids = conn.execute(
-            """SELECT id, video_path FROM waypoints
-               WHERE trip_id = ? AND timestamp = ? AND lat = ? AND lon = ?
-               ORDER BY
-                 CASE WHEN video_path LIKE '%ArchivedClips%' THEN 0 ELSE 1 END,
-                 id""",
-            (d['trip_id'], d['timestamp'], d['lat'], d['lon']),
-        ).fetchall()
-        # Keep the first (durable / lowest id), delete the rest
-        drop_ids = [(r['id'],) for r in ids[1:]]
-        if drop_ids:
-            conn.executemany("DELETE FROM waypoints WHERE id = ?", drop_ids)
-            deduped += len(drop_ids)
-    log_parts.append(f"deduped {deduped} duplicate waypoints")
-
-    # --- Phase 4: recompute trip stats; drop empty trips ---
-    # Distance is computed per video file (in frame/id order) and summed,
-    # because Tesla videos can overlap in time (e.g. when a saved clip is
-    # triggered alongside RecentClips). Sorting all waypoints globally by
-    # timestamp would interleave overlapping recordings and produce huge
-    # phantom jumps. start_time/end_time still come from min/max timestamp.
-    trips = conn.execute("SELECT id FROM trips").fetchall()
-    recomputed = 0
-    dropped_empty = 0
-    for t in trips:
-        bounds = conn.execute(
-            "SELECT MIN(timestamp) AS first_ts, MAX(timestamp) AS last_ts "
-            "FROM waypoints WHERE trip_id = ?",
-            (t['id'],),
-        ).fetchone()
-        if not bounds or not bounds['first_ts']:
-            conn.execute("DELETE FROM trips WHERE id = ?", (t['id'],))
-            dropped_empty += 1
-            continue
-        first_ts, last_ts = bounds['first_ts'], bounds['last_ts']
-        first_row = conn.execute(
-            "SELECT lat, lon FROM waypoints WHERE trip_id = ? "
-            "AND timestamp = ? ORDER BY id LIMIT 1",
-            (t['id'], first_ts),
-        ).fetchone()
-        last_row = conn.execute(
-            "SELECT lat, lon FROM waypoints WHERE trip_id = ? "
-            "AND timestamp = ? ORDER BY id DESC LIMIT 1",
-            (t['id'], last_ts),
-        ).fetchone()
-        # Distance summed per video file. Batched in a single query
-        # (#142, follows the Phase 5.1 / PR #141 shape used in
-        # mapping_service._index_video). The legacy ``1 + N`` pattern
-        # — one DISTINCT query plus one waypoint fetch per video — is
-        # replaced by a single ``ORDER BY video_path, id`` walk with a
-        # per-video boundary cursor so we never haversine across
-        # different videos (Tesla can write overlapping clips and a
-        # global sort would create phantom GPS jumps).
-        total_dist = 0.0
-        rows = conn.execute(
-            "SELECT video_path, lat, lon FROM waypoints "
-            "WHERE trip_id = ? AND video_path IS NOT NULL "
-            "ORDER BY video_path, id",
-            (t['id'],),
-        ).fetchall()
-        prev = None
-        prev_video = None
-        for w in rows:
-            video_path = w['video_path']
-            if prev is not None and video_path == prev_video:
-                total_dist += _haversine_km(
-                    prev['lat'], prev['lon'],
-                    w['lat'], w['lon'],
-                )
-            prev = w
-            prev_video = video_path
-        try:
-            dur = max(0, int((
-                datetime.fromisoformat(last_ts)
-                - datetime.fromisoformat(first_ts)
-            ).total_seconds()))
-        except (ValueError, TypeError):
-            dur = 0
-        conn.execute(
-            """UPDATE trips SET
-               start_time = ?, end_time = ?,
-               start_lat = ?, start_lon = ?,
-               end_lat = ?, end_lon = ?,
-               distance_km = ?, duration_seconds = ?
-               WHERE id = ?""",
-            (first_ts, last_ts,
-             first_row['lat'] if first_row else None,
-             first_row['lon'] if first_row else None,
-             last_row['lat'] if last_row else None,
-             last_row['lon'] if last_row else None,
-             total_dist, dur, t['id']),
-        )
-        recomputed += 1
-    log_parts.append(
-        f"recomputed stats for {recomputed} trips; dropped {dropped_empty} empty"
-    )
-
-    logger.info("Migration v2->v3: %s", "; ".join(log_parts))
-
-
 def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
     """Re-evaluate Sentry/Saved clips with Tesla's event.json.
 
@@ -993,7 +759,6 @@ _COLD_COLUMNS = (
 # ``tests/test_mapping_wave3.py``.
 _V15_HOT_COLUMNS = (
     'id',
-    'trip_id',
     'timestamp',
     'lat',
     'lon',
@@ -1010,7 +775,6 @@ _V15_HOT_COLUMNS = (
 # fresh-install v15 schema (PK, FK, NOT NULL, REFERENCES — all of it).
 _V15_HOT_COLUMN_DDL = {
     'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
-    'trip_id': 'INTEGER REFERENCES trips(id) ON DELETE CASCADE',
     'timestamp': 'TEXT NOT NULL',
     'lat': 'REAL NOT NULL',
     'lon': 'REAL NOT NULL',

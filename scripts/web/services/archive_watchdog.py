@@ -1502,13 +1502,13 @@ def reclaim_stationary_recent_clips(*,
 
         {'deleted_count': N, 'freed_bytes': M, 'scanned': K,
          'kept_too_new': T, 'kept_has_event_counterpart': E,
-         'kept_unindexed': U, 'kept_has_gps': G,
+         'kept_unindexed': U, 'kept_has_waypoints': G,
          'kept_has_event_only': V,
          'duration_seconds': S}
 
     Bucket semantics:
 
-    * ``kept_has_gps`` — clip has GPS waypoints (``waypoint_count > 0``).
+    * ``kept_has_waypoints`` — clip has movement waypoints (``waypoint_count > 0``).
       Driving footage; keep.
     * ``kept_has_event_only`` — clip has detected events but no GPS
       (``waypoint_count = 0 AND event_count > 0``). Stationary
@@ -1533,7 +1533,7 @@ def reclaim_stationary_recent_clips(*,
         'kept_too_new': 0,
         'kept_has_event_counterpart': 0,
         'kept_unindexed': 0,
-        'kept_has_gps': 0,
+        'kept_has_waypoints': 0,
         'kept_has_event_only': 0,
         'min_age_hours': int(min_age_hours),
         'duration_seconds': 0.0,
@@ -1630,7 +1630,7 @@ def reclaim_stationary_recent_clips(*,
                         # event (e.g. Sentry trigger while parked).
                         summary['kept_has_event_only'] += 1
                     elif path in indexed_set:
-                        summary['kept_has_gps'] += 1
+                        summary['kept_has_waypoints'] += 1
                     else:
                         summary['kept_unindexed'] += 1
                     continue
@@ -1675,12 +1675,12 @@ def reclaim_stationary_recent_clips(*,
     logger.info(
         "reclaim_stationary: done — deleted=%d, freed_bytes=%d, "
         "scanned=%d, kept_too_new=%d, kept_event_counterpart=%d, "
-        "kept_unindexed=%d, kept_has_gps=%d, kept_has_event_only=%d, "
+        "kept_unindexed=%d, kept_has_waypoints=%d, kept_has_event_only=%d, "
         "duration=%.2fs",
         summary['deleted_count'], summary['freed_bytes'],
         summary['scanned'], summary['kept_too_new'],
         summary['kept_has_event_counterpart'],
-        summary['kept_unindexed'], summary['kept_has_gps'],
+        summary['kept_unindexed'], summary['kept_has_waypoints'],
         summary['kept_has_event_only'],
         summary['duration_seconds'],
     )
@@ -1710,7 +1710,7 @@ def _collect_indexed_recent_paths(db_path: str,
       Tesla flagged as events). Used for the
       ``kept_has_event_only`` bucket.
     * Both False = every RecentClips row regardless of classification
-      (used for the ``kept_has_gps`` vs ``kept_unindexed`` distinction).
+      (used for the ``kept_has_waypoints`` vs ``kept_unindexed`` distinction).
 
     Returns an empty set on any DB error.
     """

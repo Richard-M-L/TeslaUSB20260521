@@ -93,7 +93,7 @@ class TestProcessClaimedItem:
         row = _make_row()
         action = indexing_worker.process_claimed_item(
             row, '_x', '_y',
-            indexer=lambda *a, **k: IndexResult(IndexOutcome.NO_GPS_RECORDED),
+            indexer=lambda *a, **k: IndexResult(IndexOutcome.NO_MOVEMENT_RECORDED),
         )
         assert action.action == 'complete'
 
